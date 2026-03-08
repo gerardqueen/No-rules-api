@@ -1,9 +1,9 @@
-
 // db.js — Database connection
 const { Pool } = require("pg");
 const url = require("url");
 
-const connectionString = process.env.DATABASE_URL;
+// Use DB_URL to avoid Railway overriding with internal URL
+const connectionString = process.env.DB_URL || process.env.DATABASE_URL;
 const parsed = url.parse(connectionString);
 const [user, password] = (parsed.auth || "").split(":");
 
