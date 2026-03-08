@@ -274,6 +274,25 @@ app.get("/health", (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // START SERVER
 // ─────────────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`✅ No Rules Nutrition API running on port ${PORT}`);
+  const bcrypt = require("bcryptjs");
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, name TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'athlete', sport TEXT, mfp_username TEXT, coach_id INTEGER, avatar_url TEXT, created_at TIMESTAMPTZ DEFAULT NOW());`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS macro_plans (id SERIAL PRIMARY KEY, athlete_id INTEGER NOT NULL, day_of_week TEXT NOT NULL, calories INTEGER NOT NULL DEFAULT 2000, protein_g INTEGER NOT NULL DEFAULT 150, carbs_g INTEGER NOT NULL DEFAULT 200, fat_g INTEGER NOT NULL DEFAULT 70, meals JSONB, updated_by INTEGER, updated_at TIMESTAMPTZ DEFAULT NOW(), UNIQUE (athlete_id, day_of_week));`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS mfp_entries (id SERIAL PRIMARY KEY, athlete_id INTEGER NOT NULL, date DATE NOT NULL, calories INTEGER DEFAULT 0, protein_g INTEGER DEFAULT 0, carbs_g INTEGER DEFAULT 0, fat_g INTEGER DEFAULT 0, fibre_g INTEGER DEFAULT 0, exercise_cals INTEGER DEFAULT 0, meals_json JSONB, source TEXT DEFAULT 'mfp_live', synced_at TIMESTAMPTZ DEFAULT NOW(), UNIQUE (athlete_id, date));`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS messages (id SERIAL PRIMARY KEY, thread_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, recipient_id INTEGER NOT NULL, body TEXT NOT NULL, read BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT NOW());`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS checkins (id SERIAL PRIMARY KEY, athlete_id INTEGER NOT NULL, date DATE NOT NULL, weight_kg DECIMAL(5,2), mood INTEGER, energy INTEGER, sleep_hrs DECIMAL(3,1), notes TEXT, photo_url TEXT, coach_reply TEXT, created_at TIMESTAMPTZ DEFAULT NOW());`);
+    const existing = await pool.query("SELECT id FROM users WHERE email = $1", ["gerard@norules.com"]);
+    if (!existing.rows[0]) {
+      const h1 = await bcrypt.hash("gerard1", 12); await pool.query(`INSERT INTO users (email,password_hash,name,role) VALUES ($1,$2,'Gerard Queen','coach')`, ["gerard@norules.com", h1]);
+      const h2 = await bcrypt.hash("luke1", 12); await pool.query(`INSERT INTO users (email,password_hash,name,role) VALUES ($1,$2,'Luke Bastick','coach')`, ["luke@norules.com", h2]);
+      const h3 = await bcrypt.hash("esme1", 12); await pool.query(`INSERT INTO users (email,password_hash,name,role) VALUES ($1,$2,'Esme','coach')`, ["esme@norules.com", h3]);
+      const h4 = await bcrypt.hash("athlete1", 12); await pool.query(`INSERT INTO users (email,password_hash,name,role,sport) VALUES ($1,$2,'Alex Morgan','athlete','Triathlon')`, ["alex@norules.com", h4]);
+      const h5 = await bcrypt.hash("athlete2", 12); await pool.query(`INSERT INTO users (email,password_hash,name,role,sport) VALUES ($1,$2,'Jamie Clarke','athlete','Powerlifting')`, ["jamie@norules.com", h5]);
+    }
+    console.log("✅ Database tables ready");
+  } catch (err) {
+    console.error("❌ Auto-migration error:", err.message);
+  }
 });
