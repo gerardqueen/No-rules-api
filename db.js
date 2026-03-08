@@ -1,17 +1,20 @@
 // db.js — Database connection
-// This file creates one shared connection pool that all routes use.
-
 const { Pool } = require("pg");
+const url = require("url");
+
+const connectionString = process.env.DATABASE_URL;
+const parsed = url.parse(connectionString);
+const [user, password] = (parsed.auth || "").split(":");
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  // Required for Railway's PostgreSQL (uses SSL)
-  ssl: process.env.DATABASE_URL?.includes("railway")
-    ? { rejectUnauthorized: false }
-    : false,
+  host:     parsed.hostname,
+  port:     parseInt(parsed.port),
+  database: (parsed.pathname || "").replace("/", ""),
+  user:     user,
+  password: password,
+  ssl:      { rejectUnauthorized: false },
 });
 
-// Test the connection when the server starts
 pool.connect((err, client, release) => {
   if (err) {
     console.error("❌ Database connection failed:", err.message);
