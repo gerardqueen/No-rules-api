@@ -40,9 +40,7 @@ function requireAuth(req, res, next) {
     req.user = decoded; // { id, email, role, name }
     return next();
   } catch (e) {
-    return res
-      .status(401)
-      .json({ error: "Session expired — please log in again" });
+    return res.status(401).json({ error: "Session expired — please log in again" });
   }
 }
 
@@ -62,9 +60,7 @@ app.post("/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body || {};
     if (!email || !password) {
-      return res
-        .status(400)
-        .json({ error: "Email and password are required" });
+      return res.status(400).json({ error: "Email and password are required" });
     }
 
     const result = await pool.query("SELECT * FROM users WHERE email = $1", [
@@ -72,14 +68,10 @@ app.post("/auth/login", async (req, res) => {
     ]);
 
     const user = result.rows[0];
-    if (!user) {
-      return res.status(401).json({ error: "Incorrect email or password" });
-    }
+    if (!user) return res.status(401).json({ error: "Incorrect email or password" });
 
     const ok = await bcrypt.compare(password, user.password_hash);
-    if (!ok) {
-      return res.status(401).json({ error: "Incorrect email or password" });
-    }
+    if (!ok) return res.status(401).json({ error: "Incorrect email or password" });
 
     const token = jwt.sign(
       { id: user.id, email: user.email, role: user.role, name: user.name },
@@ -239,7 +231,7 @@ app.put("/athletes/:id", requireAuth, requireCoach, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MACRO PLAN ROUTES (coach-only)
+// MACRO PLANS
 // ─────────────────────────────────────────────────────────────────────────────
 
 const VALID_DAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
@@ -252,7 +244,7 @@ async function coachOwnsAthlete(coachId, athleteId) {
   return !!r.rows[0];
 }
 
-// ✅ Athlete self OR coach of athlete (for client-data endpoints)
+// Athlete self OR coach of athlete
 async function requireSelfOrCoachOfAthlete(req, res, next) {
   try {
     const athleteId = Number(req.params.athleteId);
@@ -277,18 +269,12 @@ async function requireSelfOrCoachOfAthlete(req, res, next) {
   }
 }
 
-// GET /athletes/:id/macro-plans
-app.get("/athletes/:id/macro-plans", requireAuth, requireCoach, async (req, res) => {
+// ✅ Client (athlete) reads their macro targets
+app.get("/macro-plans/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
-    const athleteId = Number(req.params.id);
-    if (!Number.isInteger(athleteId) || athleteId <= 0) {
-      return res.status(400).json({ error: "Invalid athlete id" });
-    }
+    const athleteId = Number(req.params.athleteId);
 
-    const ok = await coachOwnsAthlete(req.user.id, athleteId);
-    if (!ok) return res.status(404).json({ error: "Athlete not found" });
-
-    // Ensure 7 day rows exist
+    // Ensure 7 rows exist
     for (const day of VALID_DAYS) {
       await pool.query(
         `INSERT INTO macro_plans (athlete_id, day_of_week)
@@ -310,55 +296,57 @@ app.get("/athletes/:id/macro-plans", requireAuth, requireCoach, async (req, res)
 
     return res.json(result.rows);
   } catch (err) {
-    console.error("Get macro plans error:", err);
+    console.error("Get macro plans (client) error:", err);
     return res.status(500).json({ error: "Could not fetch macro plans" });
   }
 });
 
-// PUT /athletes/:id/macro-plans/:day
-app.put("/athletes/:id/macro-plans/:day", requireAuth, requireCoach, async (req, res) => {
+// ✅ CoachCMS bulk save (used by your CoachCMS WeeklyMacroPlan)
+app.put("/macro-plans/:athleteId", requireAuth, requireCoach, async (req, res) => {
   try {
-    const athleteId = Number(req.params.id);
-    const day = String(req.params.day || "").toUpperCase();
+    const athleteId = Number(req.params.athleteId);
+    const plans = req.body?.plans;
 
     if (!Number.isInteger(athleteId) || athleteId <= 0) {
       return res.status(400).json({ error: "Invalid athlete id" });
     }
-    if (!VALID_DAYS.includes(day)) {
-      return res.status(400).json({ error: "Invalid day. Use MON..SUN" });
+    if (!Array.isArray(plans)) {
+      return res.status(400).json({ error: "plans must be an array" });
     }
 
     const ok = await coachOwnsAthlete(req.user.id, athleteId);
     if (!ok) return res.status(404).json({ error: "Athlete not found" });
 
-    const calories = Number(req.body?.calories);
-    const protein_g = Number(req.body?.protein_g);
-    const carbs_g = Number(req.body?.carbs_g);
-    const fat_g = Number(req.body?.fat_g);
+    for (const p of plans) {
+      const day = String(p.dayOfWeek || "").toUpperCase();
+      if (!VALID_DAYS.includes(day)) continue;
 
-    if ([calories, protein_g, carbs_g, fat_g].some((n) => Number.isNaN(n))) {
-      return res.status(400).json({ error: "Macros must be numbers" });
+      const calories = Number(p.calories);
+      const protein_g = Number(p.protein_g);
+      const carbs_g = Number(p.carbs_g);
+      const fat_g = Number(p.fat_g);
+
+      if ([calories, protein_g, carbs_g, fat_g].some((n) => Number.isNaN(n))) continue;
+
+      await pool.query(
+        `INSERT INTO macro_plans (athlete_id, day_of_week, calories, protein_g, carbs_g, fat_g, updated_by, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+         ON CONFLICT (athlete_id, day_of_week)
+         DO UPDATE SET
+           calories = EXCLUDED.calories,
+           protein_g = EXCLUDED.protein_g,
+           carbs_g = EXCLUDED.carbs_g,
+           fat_g = EXCLUDED.fat_g,
+           updated_by = EXCLUDED.updated_by,
+           updated_at = NOW()`,
+        [athleteId, day, calories, protein_g, carbs_g, fat_g, req.user.id]
+      );
     }
 
-    const result = await pool.query(
-      `INSERT INTO macro_plans (athlete_id, day_of_week, calories, protein_g, carbs_g, fat_g, updated_by, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-       ON CONFLICT (athlete_id, day_of_week)
-       DO UPDATE SET
-         calories = EXCLUDED.calories,
-         protein_g = EXCLUDED.protein_g,
-         carbs_g = EXCLUDED.carbs_g,
-         fat_g = EXCLUDED.fat_g,
-         updated_by = EXCLUDED.updated_by,
-         updated_at = NOW()
-       RETURNING athlete_id, day_of_week, calories, protein_g, carbs_g, fat_g, updated_by, updated_at`,
-      [athleteId, day, calories, protein_g, carbs_g, fat_g, req.user.id]
-    );
-
-    return res.json(result.rows[0]);
+    return res.json({ ok: true });
   } catch (err) {
-    console.error("Update macro plan error:", err);
-    return res.status(500).json({ error: "Could not update macro plan" });
+    console.error("Bulk update macro plans error:", err);
+    return res.status(500).json({ error: "Could not update macro plans" });
   }
 });
 
@@ -424,7 +412,7 @@ app.put("/profiles/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async 
       ]
     );
 
-    // Keep users.mfp_username in sync (auth/me reads users.mfp_username)
+    // keep users.mfp_username in sync
     if (mfpUsername !== undefined) {
       await pool.query(
         `UPDATE users SET mfp_username = COALESCE($1, mfp_username) WHERE id = $2`,
@@ -451,7 +439,6 @@ app.put("/profiles/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async 
 app.get("/weights/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
-
     const result = await pool.query(
       `SELECT date::text AS date, kg
        FROM weights
@@ -459,7 +446,6 @@ app.get("/weights/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (
        ORDER BY date DESC`,
       [athleteId]
     );
-
     return res.json(result.rows);
   } catch (err) {
     console.error("Get weights error:", err);
@@ -467,7 +453,7 @@ app.get("/weights/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (
   }
 });
 
-// POST /weights/:athleteId  Body: { date: "YYYY-MM-DD", kg: number }
+// POST /weights/:athleteId
 app.post("/weights/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
@@ -490,7 +476,7 @@ app.post("/weights/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async 
       [athleteId, date, kgNum]
     );
 
-    // Optional: also update profiles.current_weight_kg
+    // update profile current weight
     await pool.query(
       `INSERT INTO profiles (athlete_id, current_weight_kg, updated_at)
        VALUES ($1, $2, NOW())
@@ -518,14 +504,12 @@ app.post("/weights/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async 
 app.get("/meal-plans/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
-
     const result = await pool.query(
       `SELECT plan
        FROM meal_plans
        WHERE athlete_id = $1`,
       [athleteId]
     );
-
     if (!result.rows[0]) return res.json({ plan: null });
     return res.json({ plan: result.rows[0].plan });
   } catch (err) {
@@ -534,7 +518,7 @@ app.get("/meal-plans/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, asyn
   }
 });
 
-// PUT /meal-plans/:athleteId  Body: { plan: {...} }
+// PUT /meal-plans/:athleteId
 app.put("/meal-plans/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
@@ -563,7 +547,6 @@ app.put("/meal-plans/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, asyn
 // ─────────────────────────────────────────────────────────────────────────────
 // HEALTH CHECK
 // ─────────────────────────────────────────────────────────────────────────────
-
 app.get("/health", (req, res) => {
   return res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
@@ -571,7 +554,6 @@ app.get("/health", (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // START SERVER + AUTO-MIGRATIONS / SEED
 // ─────────────────────────────────────────────────────────────────────────────
-
 app.listen(PORT, async () => {
   console.log(`✅ No Rules Nutrition API running on port ${PORT}`);
 
@@ -607,7 +589,6 @@ app.listen(PORT, async () => {
       );
     `);
 
-    // ✅ New tables for client-entered data
     await pool.query(`
       CREATE TABLE IF NOT EXISTS profiles (
         athlete_id INTEGER PRIMARY KEY,
