@@ -1,6 +1,6 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // NO RULES NUTRITION — Backend Server
-// Auth + Athletes + Macro Plans
+// Auth + Athletes + Macro Plans + Profiles + Weights + Meal Plans
 // ─────────────────────────────────────────────────────────────────────────────
 require("dotenv").config();
 
@@ -57,7 +57,7 @@ function requireCoach(req, res, next) {
 // AUTH ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
 
-// POST /auth/login  Body: { email, password }  -> { token, user }
+// POST /auth/login  Body: { email, password } -> { token, user }
 app.post("/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body || {};
@@ -239,7 +239,7 @@ app.put("/athletes/:id", requireAuth, requireCoach, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MACRO PLAN ROUTES (coach-only)  ✅ NEW
+// MACRO PLAN ROUTES (coach-only)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const VALID_DAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
@@ -250,6 +250,31 @@ async function coachOwnsAthlete(coachId, athleteId) {
     [athleteId, coachId]
   );
   return !!r.rows[0];
+}
+
+// ✅ Athlete self OR coach of athlete (for client-data endpoints)
+async function requireSelfOrCoachOfAthlete(req, res, next) {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    if (!Number.isInteger(athleteId) || athleteId <= 0) {
+      return res.status(400).json({ error: "Invalid athlete id" });
+    }
+
+    // Athlete can access self
+    if (req.user?.role === "athlete" && req.user?.id === athleteId) return next();
+
+    // Coach can access their athletes
+    if (req.user?.role === "coach") {
+      const ok = await coachOwnsAthlete(req.user.id, athleteId);
+      if (!ok) return res.status(404).json({ error: "Athlete not found" });
+      return next();
+    }
+
+    return res.status(403).json({ error: "Forbidden" });
+  } catch (e) {
+    console.error("Access check error:", e);
+    return res.status(500).json({ error: "Something went wrong" });
+  }
 }
 
 // GET /athletes/:id/macro-plans
@@ -338,6 +363,204 @@ app.put("/athletes/:id/macro-plans/:day", requireAuth, requireCoach, async (req,
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CLIENT DATA ROUTES (athlete self OR coach of athlete)
+// Profiles + Weights + Meal Plans
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /profiles/:athleteId
+app.get("/profiles/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+
+    const result = await pool.query(
+      `SELECT athlete_id, goal, height_cm, current_weight_kg, mfp_username, updated_at
+       FROM profiles
+       WHERE athlete_id = $1`,
+      [athleteId]
+    );
+
+    if (!result.rows[0]) {
+      return res.json({ athleteId, goal: "", heightCm: null, currentWeightKg: null, mfpUsername: null });
+    }
+
+    const row = result.rows[0];
+    return res.json({
+      athleteId: row.athlete_id,
+      goal: row.goal,
+      heightCm: row.height_cm,
+      currentWeightKg: row.current_weight_kg,
+      mfpUsername: row.mfp_username,
+      updatedAt: row.updated_at,
+    });
+  } catch (err) {
+    console.error("Get profile error:", err);
+    return res.status(500).json({ error: "Could not fetch profile" });
+  }
+});
+
+// PUT /profiles/:athleteId
+app.put("/profiles/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const { goal, heightCm, currentWeightKg, mfpUsername } = req.body || {};
+
+    const result = await pool.query(
+      `INSERT INTO profiles (athlete_id, goal, height_cm, current_weight_kg, mfp_username, updated_at)
+       VALUES ($1, COALESCE($2,''), $3, $4, $5, NOW())
+       ON CONFLICT (athlete_id)
+       DO UPDATE SET
+         goal = COALESCE(EXCLUDED.goal,''),
+         height_cm = EXCLUDED.height_cm,
+         current_weight_kg = EXCLUDED.current_weight_kg,
+         mfp_username = EXCLUDED.mfp_username,
+         updated_at = NOW()
+       RETURNING athlete_id, goal, height_cm, current_weight_kg, mfp_username, updated_at`,
+      [
+        athleteId,
+        goal ?? "",
+        heightCm === "" ? null : heightCm ?? null,
+        currentWeightKg === "" ? null : currentWeightKg ?? null,
+        mfpUsername ?? null,
+      ]
+    );
+
+    // Keep users.mfp_username in sync (auth/me reads users.mfp_username)
+    if (mfpUsername !== undefined) {
+      await pool.query(
+        `UPDATE users SET mfp_username = COALESCE($1, mfp_username) WHERE id = $2`,
+        [mfpUsername || null, athleteId]
+      );
+    }
+
+    const row = result.rows[0];
+    return res.json({
+      athleteId: row.athlete_id,
+      goal: row.goal,
+      heightCm: row.height_cm,
+      currentWeightKg: row.current_weight_kg,
+      mfpUsername: row.mfp_username,
+      updatedAt: row.updated_at,
+    });
+  } catch (err) {
+    console.error("Save profile error:", err);
+    return res.status(500).json({ error: "Could not save profile" });
+  }
+});
+
+// GET /weights/:athleteId
+app.get("/weights/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+
+    const result = await pool.query(
+      `SELECT date::text AS date, kg
+       FROM weights
+       WHERE athlete_id = $1
+       ORDER BY date DESC`,
+      [athleteId]
+    );
+
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("Get weights error:", err);
+    return res.status(500).json({ error: "Could not fetch weights" });
+  }
+});
+
+// POST /weights/:athleteId  Body: { date: "YYYY-MM-DD", kg: number }
+app.post("/weights/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const { date, kg } = req.body || {};
+
+    if (!date || typeof date !== "string") {
+      return res.status(400).json({ error: "Date is required (YYYY-MM-DD)" });
+    }
+
+    const kgNum = Number(kg);
+    if (!Number.isFinite(kgNum) || kgNum <= 0) {
+      return res.status(400).json({ error: "kg must be a positive number" });
+    }
+
+    await pool.query(
+      `INSERT INTO weights (athlete_id, date, kg, created_at)
+       VALUES ($1, $2::date, $3, NOW())
+       ON CONFLICT (athlete_id, date)
+       DO UPDATE SET kg = EXCLUDED.kg`,
+      [athleteId, date, kgNum]
+    );
+
+    // Optional: also update profiles.current_weight_kg
+    await pool.query(
+      `INSERT INTO profiles (athlete_id, current_weight_kg, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (athlete_id)
+       DO UPDATE SET current_weight_kg = EXCLUDED.current_weight_kg, updated_at = NOW()`,
+      [athleteId, kgNum]
+    );
+
+    const updated = await pool.query(
+      `SELECT date::text AS date, kg
+       FROM weights
+       WHERE athlete_id = $1
+       ORDER BY date DESC`,
+      [athleteId]
+    );
+
+    return res.json(updated.rows);
+  } catch (err) {
+    console.error("Add weight error:", err);
+    return res.status(500).json({ error: "Could not save weight" });
+  }
+});
+
+// GET /meal-plans/:athleteId
+app.get("/meal-plans/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+
+    const result = await pool.query(
+      `SELECT plan
+       FROM meal_plans
+       WHERE athlete_id = $1`,
+      [athleteId]
+    );
+
+    if (!result.rows[0]) return res.json({ plan: null });
+    return res.json({ plan: result.rows[0].plan });
+  } catch (err) {
+    console.error("Get meal plan error:", err);
+    return res.status(500).json({ error: "Could not fetch meal plan" });
+  }
+});
+
+// PUT /meal-plans/:athleteId  Body: { plan: {...} }
+app.put("/meal-plans/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const plan = req.body?.plan;
+
+    if (!plan || typeof plan !== "object") {
+      return res.status(400).json({ error: "Plan object is required" });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO meal_plans (athlete_id, plan, updated_by, updated_at)
+       VALUES ($1, $2::jsonb, $3, NOW())
+       ON CONFLICT (athlete_id)
+       DO UPDATE SET plan = EXCLUDED.plan, updated_by = EXCLUDED.updated_by, updated_at = NOW()
+       RETURNING updated_by, updated_at`,
+      [athleteId, JSON.stringify(plan), req.user.id]
+    );
+
+    return res.json({ ok: true, updatedBy: result.rows[0].updated_by, updatedAt: result.rows[0].updated_at });
+  } catch (err) {
+    console.error("Save meal plan error:", err);
+    return res.status(500).json({ error: "Could not save meal plan" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // HEALTH CHECK
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -381,6 +604,37 @@ app.listen(PORT, async () => {
         updated_by INTEGER,
         updated_at TIMESTAMPTZ DEFAULT NOW(),
         UNIQUE (athlete_id, day_of_week)
+      );
+    `);
+
+    // ✅ New tables for client-entered data
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS profiles (
+        athlete_id INTEGER PRIMARY KEY,
+        goal TEXT DEFAULT '',
+        height_cm INTEGER,
+        current_weight_kg NUMERIC(6,2),
+        mfp_username TEXT,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS weights (
+        athlete_id INTEGER NOT NULL,
+        date DATE NOT NULL,
+        kg NUMERIC(6,2) NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (athlete_id, date)
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS meal_plans (
+        athlete_id INTEGER PRIMARY KEY,
+        plan JSONB NOT NULL DEFAULT '{}'::jsonb,
+        updated_by INTEGER,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
 
