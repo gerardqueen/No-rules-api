@@ -1,6 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // NO RULES NUTRITION — Backend Server
 // Auth + Athletes + Macro Plans + Profiles + Weights + Meal Plans + Moods
+// Fix: allow any logged-in user to access their own athleteId (prevents 403 if role is 'client')
 // ─────────────────────────────────────────────────────────────────────────────
 require("dotenv").config();
 
@@ -13,7 +14,6 @@ const { pool } = require("./db");
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// ── Middleware ───────────────────────────────────────────────────────────────
 app.use(express.json());
 
 app.use(
@@ -27,7 +27,6 @@ app.use(
   })
 );
 
-// ── Auth middleware ──────────────────────────────────────────────────────────
 function requireAuth(req, res, next) {
   const header = req.headers.authorization;
   if (!header || !header.startsWith("Bearer ")) {
@@ -51,10 +50,8 @@ function requireCoach(req, res, next) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AUTH ROUTES
+// AUTH
 // ─────────────────────────────────────────────────────────────────────────────
-
-// POST /auth/login  Body: { email, password } -> { token, user }
 app.post("/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body || {};
@@ -97,7 +94,6 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
-// GET /auth/me
 app.get("/auth/me", requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
@@ -125,72 +121,9 @@ app.get("/auth/me", requireAuth, async (req, res) => {
   }
 });
 
-// POST /auth/logout (client deletes token)
-app.post("/auth/logout", requireAuth, (req, res) => {
-  return res.json({ message: "Logged out successfully" });
-});
-
 // ─────────────────────────────────────────────────────────────────────────────
-// ATHLETE ROUTES (coach-only)
+// AUTHZ helper: allow self regardless of role + allow coach for their athletes
 // ─────────────────────────────────────────────────────────────────────────────
-
-app.get("/athletes", requireAuth, requireCoach, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, email, name, sport, mfp_username, avatar_url, created_at
-       FROM users
-       WHERE coach_id = $1 AND role = 'athlete'
-       ORDER BY name ASC`,
-      [req.user.id]
-    );
-    return res.json(result.rows);
-  } catch (err) {
-    console.error("Get athletes error:", err);
-    return res.status(500).json({ error: "Could not fetch athletes" });
-  }
-});
-
-app.post("/athletes", requireAuth, requireCoach, async (req, res) => {
-  try {
-    const { email, name, password, sport, mfpUsername } = req.body || {};
-    if (!email || !name || !password) {
-      return res.status(400).json({ error: "Email, name and password are required" });
-    }
-
-    const existing = await pool.query("SELECT id FROM users WHERE email = $1", [
-      String(email).toLowerCase().trim(),
-    ]);
-    if (existing.rows[0]) {
-      return res.status(409).json({ error: "An account with that email already exists" });
-    }
-
-    const passwordHash = await bcrypt.hash(password, 12);
-
-    const result = await pool.query(
-      `INSERT INTO users (email, password_hash, name, role, sport, mfp_username, coach_id)
-       VALUES ($1, $2, $3, 'athlete', $4, $5, $6)
-       RETURNING id, email, name, sport, mfp_username, avatar_url, created_at`,
-      [
-        String(email).toLowerCase().trim(),
-        passwordHash,
-        name,
-        sport || null,
-        mfpUsername || null,
-        req.user.id,
-      ]
-    );
-
-    return res.status(201).json(result.rows[0]);
-  } catch (err) {
-    console.error("Create athlete error:", err);
-    return res.status(500).json({ error: "Could not create athlete" });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MACRO PLANS
-// ─────────────────────────────────────────────────────────────────────────────
-
 const VALID_DAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
 
 async function coachOwnsAthlete(coachId, athleteId) {
@@ -208,8 +141,10 @@ async function requireSelfOrCoachOfAthlete(req, res, next) {
       return res.status(400).json({ error: "Invalid athlete id" });
     }
 
-    if (req.user?.role === "athlete" && req.user?.id === athleteId) return next();
+    // ✅ ANY logged-in user can access their own data (fixes 403 for role='client')
+    if (req.user?.id === athleteId) return next();
 
+    // ✅ Coach can access their athletes
     if (req.user?.role === "coach") {
       const ok = await coachOwnsAthlete(req.user.id, athleteId);
       if (!ok) return res.status(404).json({ error: "Athlete not found" });
@@ -223,7 +158,28 @@ async function requireSelfOrCoachOfAthlete(req, res, next) {
   }
 }
 
-// GET /macro-plans/:athleteId (client + coach)
+// ─────────────────────────────────────────────────────────────────────────────
+// ATHLETES (coach)
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/athletes", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, email, name, sport, mfp_username, avatar_url, created_at
+       FROM users
+       WHERE coach_id = $1 AND role = 'athlete'
+       ORDER BY name ASC`,
+      [req.user.id]
+    );
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("Get athletes error:", err);
+    return res.status(500).json({ error: "Could not fetch athletes" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MACRO PLANS
+// ─────────────────────────────────────────────────────────────────────────────
 app.get("/macro-plans/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
@@ -254,15 +210,11 @@ app.get("/macro-plans/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, asy
   }
 });
 
-// PUT /macro-plans/:athleteId (coach bulk save)
 app.put("/macro-plans/:athleteId", requireAuth, requireCoach, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
     const plans = req.body?.plans;
 
-    if (!Number.isInteger(athleteId) || athleteId <= 0) {
-      return res.status(400).json({ error: "Invalid athlete id" });
-    }
     if (!Array.isArray(plans)) {
       return res.status(400).json({ error: "plans must be an array" });
     }
@@ -304,17 +256,14 @@ app.put("/macro-plans/:athleteId", requireAuth, requireCoach, async (req, res) =
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CLIENT DATA ROUTES (weights, moods, profiles, meal plans)
+// PROFILES
 // ─────────────────────────────────────────────────────────────────────────────
-
-// GET /profiles/:athleteId
 app.get("/profiles/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
     const result = await pool.query(
       `SELECT athlete_id, goal, height_cm, current_weight_kg, mfp_username, updated_at
-       FROM profiles
-       WHERE athlete_id = $1`,
+       FROM profiles WHERE athlete_id = $1`,
       [athleteId]
     );
     if (!result.rows[0]) {
@@ -335,7 +284,6 @@ app.get("/profiles/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async 
   }
 });
 
-// PUT /profiles/:athleteId
 app.put("/profiles/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
@@ -345,22 +293,14 @@ app.put("/profiles/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async 
       `INSERT INTO profiles (athlete_id, goal, height_cm, current_weight_kg, mfp_username, updated_at)
        VALUES ($1, COALESCE($2,''), $3, $4, $5, NOW())
        ON CONFLICT (athlete_id)
-       DO UPDATE SET
-         goal = COALESCE(EXCLUDED.goal,''),
-         height_cm = EXCLUDED.height_cm,
-         current_weight_kg = EXCLUDED.current_weight_kg,
-         mfp_username = EXCLUDED.mfp_username,
-         updated_at = NOW()
+       DO UPDATE SET goal = COALESCE(EXCLUDED.goal,''),
+                    height_cm = EXCLUDED.height_cm,
+                    current_weight_kg = EXCLUDED.current_weight_kg,
+                    mfp_username = EXCLUDED.mfp_username,
+                    updated_at = NOW()
        RETURNING athlete_id, goal, height_cm, current_weight_kg, mfp_username, updated_at`,
       [athleteId, goal ?? "", heightCm ?? null, currentWeightKg ?? null, mfpUsername ?? null]
     );
-
-    if (mfpUsername !== undefined) {
-      await pool.query(
-        `UPDATE users SET mfp_username = COALESCE($1, mfp_username) WHERE id = $2`,
-        [mfpUsername || null, athleteId]
-      );
-    }
 
     const row = result.rows[0];
     return res.json({
@@ -377,7 +317,9 @@ app.put("/profiles/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async 
   }
 });
 
-// GET /weights/:athleteId
+// ─────────────────────────────────────────────────────────────────────────────
+// WEIGHTS
+// ─────────────────────────────────────────────────────────────────────────────
 app.get("/weights/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
@@ -395,19 +337,14 @@ app.get("/weights/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (
   }
 });
 
-// POST /weights/:athleteId
 app.post("/weights/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
     const { date, kg } = req.body || {};
 
-    if (!date || typeof date !== "string") {
-      return res.status(400).json({ error: "Date is required (YYYY-MM-DD)" });
-    }
-
     const kgNum = Number(kg);
-    if (!Number.isFinite(kgNum) || kgNum <= 0) {
-      return res.status(400).json({ error: "kg must be a positive number" });
+    if (!date || typeof date !== "string" || !Number.isFinite(kgNum) || kgNum <= 0) {
+      return res.status(400).json({ error: "Invalid payload" });
     }
 
     await pool.query(
@@ -433,7 +370,9 @@ app.post("/weights/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async 
   }
 });
 
-// GET /moods/:athleteId
+// ─────────────────────────────────────────────────────────────────────────────
+// MOODS
+// ─────────────────────────────────────────────────────────────────────────────
 app.get("/moods/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
@@ -451,19 +390,14 @@ app.get("/moods/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (re
   }
 });
 
-// POST /moods/:athleteId  Body: { date, id, emoji, label, color, note }
 app.post("/moods/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
     const { date, id, emoji, label, color, note } = req.body || {};
 
-    if (!date || typeof date !== "string") {
-      return res.status(400).json({ error: "Date is required (YYYY-MM-DD)" });
-    }
-
     const moodId = Number(id);
-    if (!Number.isFinite(moodId) || moodId <= 0) {
-      return res.status(400).json({ error: "Mood id must be a positive number" });
+    if (!date || typeof date !== "string" || !Number.isFinite(moodId) || moodId <= 0) {
+      return res.status(400).json({ error: "Invalid payload" });
     }
 
     await pool.query(
@@ -489,14 +423,14 @@ app.post("/moods/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (r
   }
 });
 
-// GET /meal-plans/:athleteId
+// ─────────────────────────────────────────────────────────────────────────────
+// MEAL PLANS
+// ─────────────────────────────────────────────────────────────────────────────
 app.get("/meal-plans/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
     const result = await pool.query(
-      `SELECT plan
-       FROM meal_plans
-       WHERE athlete_id = $1`,
+      `SELECT plan FROM meal_plans WHERE athlete_id = $1`,
       [athleteId]
     );
     if (!result.rows[0]) return res.json({ plan: null });
@@ -507,12 +441,10 @@ app.get("/meal-plans/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, asyn
   }
 });
 
-// PUT /meal-plans/:athleteId
 app.put("/meal-plans/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
     const plan = req.body?.plan;
-
     if (!plan || typeof plan !== "object") {
       return res.status(400).json({ error: "Plan object is required" });
     }
@@ -532,16 +464,10 @@ app.put("/meal-plans/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, asyn
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HEALTH CHECK
-// ─────────────────────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
   return res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// START SERVER + AUTO-MIGRATIONS / SEED
-// ─────────────────────────────────────────────────────────────────────────────
 app.listen(PORT, async () => {
   console.log(`✅ No Rules Nutrition API running on port ${PORT}`);
 
@@ -620,31 +546,6 @@ app.listen(PORT, async () => {
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
-
-    // Seed coaches once
-    const existing = await pool.query("SELECT id FROM users WHERE email = $1", [
-      "gerard@norules.com",
-    ]);
-
-    if (!existing.rows[0]) {
-      const h1 = await bcrypt.hash("gerard1", 12);
-      await pool.query(
-        `INSERT INTO users (email,password_hash,name,role) VALUES ($1,$2,$3,$4)`,
-        ["gerard@norules.com", h1, "Gerard Queen", "coach"]
-      );
-
-      const h2 = await bcrypt.hash("luke1", 12);
-      await pool.query(
-        `INSERT INTO users (email,password_hash,name,role) VALUES ($1,$2,$3,$4)`,
-        ["luke@norules.com", h2, "Luke Bastick", "coach"]
-      );
-
-      const h3 = await bcrypt.hash("esme1", 12);
-      await pool.query(
-        `INSERT INTO users (email,password_hash,name,role) VALUES ($1,$2,$3,$4)`,
-        ["esme@norules.com", h3, "Esme", "coach"]
-      );
-    }
 
     console.log("✅ DB ready");
   } catch (err) {
