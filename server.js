@@ -1,7 +1,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // NO RULES NUTRITION — Backend Server
 // Auth + Athletes + Macro Plans + Profiles + Weights + Meal Plans + Moods
-// Fix: allow any logged-in user to access their own athleteId (prevents 403 if role is 'client')
+// v3: fixes 404s by including all endpoints and fixes 403 by allowing self regardless of role
+//     coach access allowed for any user with coach_id = coach and role != 'coach'
 // ─────────────────────────────────────────────────────────────────────────────
 require("dotenv").config();
 
@@ -122,13 +123,13 @@ app.get("/auth/me", requireAuth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AUTHZ helper: allow self regardless of role + allow coach for their athletes
+// AUTHZ helper: allow self regardless of role + allow coach for their users (role != coach)
 // ─────────────────────────────────────────────────────────────────────────────
 const VALID_DAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
 
 async function coachOwnsAthlete(coachId, athleteId) {
   const r = await pool.query(
-    `SELECT id FROM users WHERE id = $1 AND coach_id = $2 AND role = 'athlete'`,
+    `SELECT id FROM users WHERE id = $1 AND coach_id = $2 AND role <> 'coach'`,
     [athleteId, coachId]
   );
   return !!r.rows[0];
@@ -141,10 +142,10 @@ async function requireSelfOrCoachOfAthlete(req, res, next) {
       return res.status(400).json({ error: "Invalid athlete id" });
     }
 
-    // ✅ ANY logged-in user can access their own data (fixes 403 for role='client')
+    // ✅ any logged-in user can access their own records
     if (req.user?.id === athleteId) return next();
 
-    // ✅ Coach can access their athletes
+    // ✅ coaches can access users assigned to them
     if (req.user?.role === "coach") {
       const ok = await coachOwnsAthlete(req.user.id, athleteId);
       if (!ok) return res.status(404).json({ error: "Athlete not found" });
@@ -164,9 +165,9 @@ async function requireSelfOrCoachOfAthlete(req, res, next) {
 app.get("/athletes", requireAuth, requireCoach, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, email, name, sport, mfp_username, avatar_url, created_at
+      `SELECT id, email, name, role, sport, mfp_username, avatar_url, created_at
        FROM users
-       WHERE coach_id = $1 AND role = 'athlete'
+       WHERE coach_id = $1 AND role <> 'coach'
        ORDER BY name ASC`,
       [req.user.id]
     );
@@ -174,6 +175,43 @@ app.get("/athletes", requireAuth, requireCoach, async (req, res) => {
   } catch (err) {
     console.error("Get athletes error:", err);
     return res.status(500).json({ error: "Could not fetch athletes" });
+  }
+});
+
+app.post("/athletes", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { email, name, password, sport, mfpUsername } = req.body || {};
+    if (!email || !name || !password) {
+      return res.status(400).json({ error: "Email, name and password are required" });
+    }
+
+    const existing = await pool.query("SELECT id FROM users WHERE email = $1", [
+      String(email).toLowerCase().trim(),
+    ]);
+    if (existing.rows[0]) {
+      return res.status(409).json({ error: "An account with that email already exists" });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 12);
+
+    const result = await pool.query(
+      `INSERT INTO users (email, password_hash, name, role, sport, mfp_username, coach_id)
+       VALUES ($1, $2, $3, 'athlete', $4, $5, $6)
+       RETURNING id, email, name, role, sport, mfp_username, avatar_url, created_at`,
+      [
+        String(email).toLowerCase().trim(),
+        passwordHash,
+        name,
+        sport || null,
+        mfpUsername || null,
+        req.user.id,
+      ]
+    );
+
+    return res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error("Create athlete error:", err);
+    return res.status(500).json({ error: "Could not create athlete" });
   }
 });
 
@@ -464,10 +502,16 @@ app.put("/meal-plans/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, asyn
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// HEALTH
+// ─────────────────────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
   return res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// START + AUTO TABLES
+// ─────────────────────────────────────────────────────────────────────────────
 app.listen(PORT, async () => {
   console.log(`✅ No Rules Nutrition API running on port ${PORT}`);
 
