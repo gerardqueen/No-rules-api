@@ -1,6 +1,6 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // NO RULES NUTRITION — Backend Server
-// Auth + Athletes + Macro Plans + Profiles + Weights + Meal Plans
+// Auth + Athletes + Macro Plans + Profiles + Weights + Meal Plans + Moods
 // ─────────────────────────────────────────────────────────────────────────────
 require("dotenv").config();
 
@@ -33,7 +33,6 @@ function requireAuth(req, res, next) {
   if (!header || !header.startsWith("Bearer ")) {
     return res.status(401).json({ error: "Not logged in" });
   }
-
   try {
     const token = header.split(" ")[1];
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
@@ -126,7 +125,7 @@ app.get("/auth/me", requireAuth, async (req, res) => {
   }
 });
 
-// POST /auth/logout (client deletes token; endpoint exists for symmetry)
+// POST /auth/logout (client deletes token)
 app.post("/auth/logout", requireAuth, (req, res) => {
   return res.json({ message: "Logged out successfully" });
 });
@@ -148,25 +147,6 @@ app.get("/athletes", requireAuth, requireCoach, async (req, res) => {
   } catch (err) {
     console.error("Get athletes error:", err);
     return res.status(500).json({ error: "Could not fetch athletes" });
-  }
-});
-
-app.get("/athletes/:id", requireAuth, requireCoach, async (req, res) => {
-  try {
-    const athleteId = Number(req.params.id);
-
-    const result = await pool.query(
-      `SELECT id, email, name, sport, mfp_username, avatar_url, created_at
-       FROM users
-       WHERE id = $1 AND coach_id = $2 AND role = 'athlete'`,
-      [athleteId, req.user.id]
-    );
-
-    if (!result.rows[0]) return res.status(404).json({ error: "Athlete not found" });
-    return res.json(result.rows[0]);
-  } catch (err) {
-    console.error("Get athlete error:", err);
-    return res.status(500).json({ error: "Could not fetch athlete" });
   }
 });
 
@@ -207,29 +187,6 @@ app.post("/athletes", requireAuth, requireCoach, async (req, res) => {
   }
 });
 
-app.put("/athletes/:id", requireAuth, requireCoach, async (req, res) => {
-  try {
-    const athleteId = Number(req.params.id);
-    const { name, sport, mfpUsername } = req.body || {};
-
-    const result = await pool.query(
-      `UPDATE users
-       SET name = COALESCE($1, name),
-           sport = COALESCE($2, sport),
-           mfp_username = COALESCE($3, mfp_username)
-       WHERE id = $4 AND coach_id = $5 AND role = 'athlete'
-       RETURNING id, email, name, sport, mfp_username, avatar_url`,
-      [name, sport, mfpUsername, athleteId, req.user.id]
-    );
-
-    if (!result.rows[0]) return res.status(404).json({ error: "Athlete not found" });
-    return res.json(result.rows[0]);
-  } catch (err) {
-    console.error("Update athlete error:", err);
-    return res.status(500).json({ error: "Could not update athlete" });
-  }
-});
-
 // ─────────────────────────────────────────────────────────────────────────────
 // MACRO PLANS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -244,7 +201,6 @@ async function coachOwnsAthlete(coachId, athleteId) {
   return !!r.rows[0];
 }
 
-// Athlete self OR coach of athlete
 async function requireSelfOrCoachOfAthlete(req, res, next) {
   try {
     const athleteId = Number(req.params.athleteId);
@@ -252,10 +208,8 @@ async function requireSelfOrCoachOfAthlete(req, res, next) {
       return res.status(400).json({ error: "Invalid athlete id" });
     }
 
-    // Athlete can access self
     if (req.user?.role === "athlete" && req.user?.id === athleteId) return next();
 
-    // Coach can access their athletes
     if (req.user?.role === "coach") {
       const ok = await coachOwnsAthlete(req.user.id, athleteId);
       if (!ok) return res.status(404).json({ error: "Athlete not found" });
@@ -269,12 +223,11 @@ async function requireSelfOrCoachOfAthlete(req, res, next) {
   }
 }
 
-// ✅ Client (athlete) reads their macro targets
+// GET /macro-plans/:athleteId (client + coach)
 app.get("/macro-plans/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
 
-    // Ensure 7 rows exist
     for (const day of VALID_DAYS) {
       await pool.query(
         `INSERT INTO macro_plans (athlete_id, day_of_week)
@@ -296,12 +249,12 @@ app.get("/macro-plans/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, asy
 
     return res.json(result.rows);
   } catch (err) {
-    console.error("Get macro plans (client) error:", err);
+    console.error("Get macro plans error:", err);
     return res.status(500).json({ error: "Could not fetch macro plans" });
   }
 });
 
-// ✅ CoachCMS bulk save (used by your CoachCMS WeeklyMacroPlan)
+// PUT /macro-plans/:athleteId (coach bulk save)
 app.put("/macro-plans/:athleteId", requireAuth, requireCoach, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
@@ -351,26 +304,22 @@ app.put("/macro-plans/:athleteId", requireAuth, requireCoach, async (req, res) =
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CLIENT DATA ROUTES (athlete self OR coach of athlete)
-// Profiles + Weights + Meal Plans
+// CLIENT DATA ROUTES (weights, moods, profiles, meal plans)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // GET /profiles/:athleteId
 app.get("/profiles/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
-
     const result = await pool.query(
       `SELECT athlete_id, goal, height_cm, current_weight_kg, mfp_username, updated_at
        FROM profiles
        WHERE athlete_id = $1`,
       [athleteId]
     );
-
     if (!result.rows[0]) {
       return res.json({ athleteId, goal: "", heightCm: null, currentWeightKg: null, mfpUsername: null });
     }
-
     const row = result.rows[0];
     return res.json({
       athleteId: row.athlete_id,
@@ -403,16 +352,9 @@ app.put("/profiles/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async 
          mfp_username = EXCLUDED.mfp_username,
          updated_at = NOW()
        RETURNING athlete_id, goal, height_cm, current_weight_kg, mfp_username, updated_at`,
-      [
-        athleteId,
-        goal ?? "",
-        heightCm === "" ? null : heightCm ?? null,
-        currentWeightKg === "" ? null : currentWeightKg ?? null,
-        mfpUsername ?? null,
-      ]
+      [athleteId, goal ?? "", heightCm ?? null, currentWeightKg ?? null, mfpUsername ?? null]
     );
 
-    // keep users.mfp_username in sync
     if (mfpUsername !== undefined) {
       await pool.query(
         `UPDATE users SET mfp_username = COALESCE($1, mfp_username) WHERE id = $2`,
@@ -476,15 +418,6 @@ app.post("/weights/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async 
       [athleteId, date, kgNum]
     );
 
-    // update profile current weight
-    await pool.query(
-      `INSERT INTO profiles (athlete_id, current_weight_kg, updated_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (athlete_id)
-       DO UPDATE SET current_weight_kg = EXCLUDED.current_weight_kg, updated_at = NOW()`,
-      [athleteId, kgNum]
-    );
-
     const updated = await pool.query(
       `SELECT date::text AS date, kg
        FROM weights
@@ -497,6 +430,62 @@ app.post("/weights/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async 
   } catch (err) {
     console.error("Add weight error:", err);
     return res.status(500).json({ error: "Could not save weight" });
+  }
+});
+
+// GET /moods/:athleteId
+app.get("/moods/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const result = await pool.query(
+      `SELECT date::text AS date, mood_id, emoji, label, color, note
+       FROM mood_logs
+       WHERE athlete_id = $1
+       ORDER BY date DESC`,
+      [athleteId]
+    );
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("Get moods error:", err);
+    return res.status(500).json({ error: "Could not fetch moods" });
+  }
+});
+
+// POST /moods/:athleteId  Body: { date, id, emoji, label, color, note }
+app.post("/moods/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const { date, id, emoji, label, color, note } = req.body || {};
+
+    if (!date || typeof date !== "string") {
+      return res.status(400).json({ error: "Date is required (YYYY-MM-DD)" });
+    }
+
+    const moodId = Number(id);
+    if (!Number.isFinite(moodId) || moodId <= 0) {
+      return res.status(400).json({ error: "Mood id must be a positive number" });
+    }
+
+    await pool.query(
+      `INSERT INTO mood_logs (athlete_id, date, mood_id, emoji, label, color, note, created_at)
+       VALUES ($1, $2::date, $3, $4, $5, $6, $7, NOW())
+       ON CONFLICT (athlete_id, date)
+       DO UPDATE SET mood_id = EXCLUDED.mood_id, emoji = EXCLUDED.emoji, label = EXCLUDED.label, color = EXCLUDED.color, note = EXCLUDED.note`,
+      [athleteId, date, moodId, emoji || null, label || null, color || null, note || null]
+    );
+
+    const updated = await pool.query(
+      `SELECT date::text AS date, mood_id, emoji, label, color, note
+       FROM mood_logs
+       WHERE athlete_id = $1
+       ORDER BY date DESC`,
+      [athleteId]
+    );
+
+    return res.json(updated.rows);
+  } catch (err) {
+    console.error("Save mood error:", err);
+    return res.status(500).json({ error: "Could not save mood" });
   }
 });
 
@@ -528,16 +517,15 @@ app.put("/meal-plans/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, asyn
       return res.status(400).json({ error: "Plan object is required" });
     }
 
-    const result = await pool.query(
+    await pool.query(
       `INSERT INTO meal_plans (athlete_id, plan, updated_by, updated_at)
        VALUES ($1, $2::jsonb, $3, NOW())
        ON CONFLICT (athlete_id)
-       DO UPDATE SET plan = EXCLUDED.plan, updated_by = EXCLUDED.updated_by, updated_at = NOW()
-       RETURNING updated_by, updated_at`,
+       DO UPDATE SET plan = EXCLUDED.plan, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
       [athleteId, JSON.stringify(plan), req.user.id]
     );
 
-    return res.json({ ok: true, updatedBy: result.rows[0].updated_by, updatedAt: result.rows[0].updated_at });
+    return res.json({ ok: true });
   } catch (err) {
     console.error("Save meal plan error:", err);
     return res.status(500).json({ error: "Could not save meal plan" });
@@ -605,6 +593,20 @@ app.listen(PORT, async () => {
         athlete_id INTEGER NOT NULL,
         date DATE NOT NULL,
         kg NUMERIC(6,2) NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (athlete_id, date)
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mood_logs (
+        athlete_id INTEGER NOT NULL,
+        date DATE NOT NULL,
+        mood_id INTEGER NOT NULL,
+        emoji TEXT,
+        label TEXT,
+        color TEXT,
+        note TEXT,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         PRIMARY KEY (athlete_id, date)
       );
