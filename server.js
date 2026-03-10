@@ -178,6 +178,84 @@ app.get("/athletes", requireAuth, requireCoach, async (req, res) => {
   }
 });
 
+app.get("/coach/overview", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const days = Math.max(7, Math.min(180, Number(req.query.days || 30)));
+    const end = new Date();
+    end.setHours(0, 0, 0, 0);
+    const start = new Date(end);
+    start.setDate(end.getDate() - (days - 1));
+
+    const startISO = start.toISOString().slice(0, 10);
+    const endISO = end.toISOString().slice(0, 10);
+
+    const athletes = await pool.query(
+      `SELECT id, name, email, sport
+       FROM users
+       WHERE coach_id = $1 AND role <> 'coach'
+       ORDER BY name ASC`,
+      [req.user.id]
+    );
+
+    const out = [];
+    for (const a of athletes.rows) {
+      const aid = a.id;
+      const wLatest = await pool.query(`SELECT date::text AS date, kg FROM weights WHERE athlete_id=$1 ORDER BY date DESC LIMIT 1`, [aid]);
+      const wStart = await pool.query(`SELECT date::text AS date, kg FROM weights WHERE athlete_id=$1 AND date >= $2::date AND date <= $3::date ORDER BY date ASC LIMIT 1`, [aid, startISO, endISO]);
+
+      const latestKg = wLatest.rows[0]?.kg ?? null;
+      const startKg = wStart.rows[0]?.kg ?? null;
+      const weightChangePct = (startKg && latestKg && Number(startKg) > 0) ? ((Number(latestKg) - Number(startKg)) / Number(startKg)) * 100 : null;
+
+      const moodAvgQ = await pool.query(`SELECT AVG(mood_id)::float AS avg FROM mood_logs WHERE athlete_id=$1 AND date >= $2::date AND date <= $3::date`, [aid, startISO, endISO]);
+      const moodAvg = moodAvgQ.rows[0]?.avg ?? null;
+
+      const adherQ = await pool.query(
+        `WITH dt AS (
+           SELECT date, calories
+           FROM daily_totals
+           WHERE athlete_id = $1 AND date >= $2::date AND date <= $3::date
+         ),
+         base AS (
+           SELECT dt.date,
+                  dt.calories AS consumed,
+                  COALESCE(mt.calories, mp.calories) AS target
+           FROM dt
+           LEFT JOIN macro_targets mt ON mt.athlete_id = $1 AND mt.date = dt.date
+           LEFT JOIN macro_plans mp ON mp.athlete_id = $1 AND mp.day_of_week = (
+             CASE EXTRACT(DOW FROM dt.date)
+               WHEN 0 THEN 'SUN'
+               WHEN 1 THEN 'MON'
+               WHEN 2 THEN 'TUE'
+               WHEN 3 THEN 'WED'
+               WHEN 4 THEN 'THU'
+               WHEN 5 THEN 'FRI'
+               WHEN 6 THEN 'SAT'
+             END
+           )
+         )
+         SELECT COUNT(*)::int AS total_days,
+                SUM(CASE WHEN target IS NOT NULL AND target > 0 AND ABS(consumed - target) / target <= 0.10 THEN 1 ELSE 0 END)::int AS adhered_days
+         FROM base
+         WHERE target IS NOT NULL AND target > 0`,
+        [aid, startISO, endISO]
+      );
+
+      const totalDays = adherQ.rows[0]?.total_days ?? 0;
+      const adheredDays = adherQ.rows[0]?.adhered_days ?? 0;
+      const adherencePct = totalDays > 0 ? (adheredDays / totalDays) * 100 : null;
+
+      out.push({ id: aid, name: a.name, email: a.email, sport: a.sport, latestKg, weightChangePct, moodAvg, adherencePct });
+    }
+
+    return res.json({ start: startISO, end: endISO, days, athletes: out });
+  } catch (err) {
+    console.error("Coach overview error:", err);
+    return res.status(500).json({ error: "Could not compute overview" });
+  }
+});
+
+
 app.post("/athletes", requireAuth, requireCoach, async (req, res) => {
   try {
     const { email, name, password, sport, mfpUsername } = req.body || {};
@@ -214,6 +292,42 @@ app.post("/athletes", requireAuth, requireCoach, async (req, res) => {
     return res.status(500).json({ error: "Could not create athlete" });
   }
 });
+
+app.delete("/athletes/:athleteId", requireAuth, requireCoach, async (req, res) => {
+  const athleteId = Number(req.params.athleteId);
+  if (!Number.isInteger(athleteId) || athleteId <= 0) return res.status(400).json({ error: "Invalid athlete id" });
+
+  try {
+    const ok = await coachOwnsAthlete(req.user.id, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('DELETE FROM coach_checkins WHERE athlete_id = $1', [athleteId]);
+      await client.query('DELETE FROM daily_totals WHERE athlete_id = $1', [athleteId]);
+      await client.query('DELETE FROM macro_targets WHERE athlete_id = $1', [athleteId]);
+      await client.query('DELETE FROM weights WHERE athlete_id = $1', [athleteId]);
+      await client.query('DELETE FROM mood_logs WHERE athlete_id = $1', [athleteId]);
+      await client.query('DELETE FROM meal_plans WHERE athlete_id = $1', [athleteId]);
+      await client.query('DELETE FROM profiles WHERE athlete_id = $1', [athleteId]);
+      await client.query('DELETE FROM macro_plans WHERE athlete_id = $1', [athleteId]);
+      await client.query("DELETE FROM users WHERE id = $1 AND coach_id = $2 AND role <> 'coach'", [athleteId, req.user.id]);
+      await client.query('COMMIT');
+      return res.json({ ok: true });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      console.error('Delete athlete transaction error:', err);
+      return res.status(500).json({ error: 'Could not delete athlete' });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('Delete athlete error:', err);
+    return res.status(500).json({ error: 'Could not delete athlete' });
+  }
+});
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MACRO PLANS
@@ -295,10 +409,6 @@ app.put("/macro-plans/:athleteId", requireAuth, requireCoach, async (req, res) =
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DAILY TOTALS (Macros Consumed) — calendar/date based
-// - Client saves totals per date
-// - Coach reads the same data for 6+ month history
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /daily-totals/:athleteId?start=YYYY-MM-DD&end=YYYY-MM-DD
 app.get("/daily-totals/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
@@ -309,10 +419,8 @@ app.get("/daily-totals/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, as
              FROM daily_totals
              WHERE athlete_id = $1`;
     const params = [athleteId];
-
     if (start) { params.push(start); q += ` AND date >= $${params.length}::date`; }
     if (end) { params.push(end); q += ` AND date <= $${params.length}::date`; }
-
     q += ` ORDER BY date DESC`;
 
     const result = await pool.query(q, params);
@@ -323,22 +431,16 @@ app.get("/daily-totals/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, as
   }
 });
 
-// POST /daily-totals/:athleteId
-// body: { date, calories, protein_g, carbs_g, fat_g, note, source }
 app.post("/daily-totals/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
     const { date, calories, protein_g, carbs_g, fat_g, note, source } = req.body || {};
-
-    if (!date || typeof date !== "string") {
-      return res.status(400).json({ error: "date (YYYY-MM-DD) is required" });
-    }
+    if (!date || typeof date !== "string") return res.status(400).json({ error: "date (YYYY-MM-DD) is required" });
 
     const cals = Number(calories);
     const p = Number(protein_g);
     const c = Number(carbs_g);
     const f = Number(fat_g);
-
     if ([cals, p, c, f].some((n) => !Number.isFinite(n) || n < 0)) {
       return res.status(400).json({ error: "Invalid macro numbers" });
     }
@@ -373,33 +475,25 @@ app.post("/daily-totals/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, a
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MACRO TARGETS — calendar/date based (coach -> client) with 6+ month history
-// - Coach sets targets per date
-// - Client reads targets by date range
-// - Fallback: weekly /macro-plans (day-of-week)
-// ─────────────────────────────────────────────────────────────────────────────
+// MACRO TARGETS — calendar/date based (coach -> client)
 function dayKeyFromISO(iso) {
   const d = new Date(`${iso}T00:00:00Z`);
-  const js = d.getUTCDay(); // 0 Sun
+  const js = d.getUTCDay();
   const idx = js === 0 ? 6 : js - 1;
   return VALID_DAYS[idx];
 }
 
-// GET /macro-targets/:athleteId?start=YYYY-MM-DD&end=YYYY-MM-DD
 app.get("/macro-targets/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
     const start = req.query.start ? String(req.query.start) : null;
     const end = req.query.end ? String(req.query.end) : null;
-
     if (!start || !end) return res.status(400).json({ error: "start and end (YYYY-MM-DD) are required" });
 
     const startD = new Date(`${start}T00:00:00Z`);
     const endD = new Date(`${end}T00:00:00Z`);
     const days = Math.floor((endD - startD) / 86400000) + 1;
-    if (!Number.isFinite(days) || days <= 0 || days > 370) {
-      return res.status(400).json({ error: "Range too large (max 370 days)" });
-    }
+    if (!Number.isFinite(days) || days <= 0 || days > 370) return res.status(400).json({ error: "Range too large (max 370 days)" });
 
     const overrides = await pool.query(
       `SELECT date::text AS date, calories, protein_g, carbs_g, fat_g, updated_at
@@ -408,7 +502,7 @@ app.get("/macro-targets/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, a
       [athleteId, start, end]
     );
     const ovMap = {};
-    overrides.rows.forEach((r) => { ovMap[r.date] = r; });
+    overrides.rows.forEach((r) => (ovMap[r.date] = r));
 
     const plan = await pool.query(
       `SELECT day_of_week, calories, protein_g, carbs_g, fat_g
@@ -417,35 +511,18 @@ app.get("/macro-targets/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, a
       [athleteId]
     );
     const planMap = {};
-    plan.rows.forEach((r) => { planMap[r.day_of_week] = r; });
+    plan.rows.forEach((r) => (planMap[r.day_of_week] = r));
 
     const out = [];
     for (let i = 0; i < days; i++) {
       const cur = new Date(startD.getTime() + i * 86400000);
       const iso = cur.toISOString().slice(0, 10);
       if (ovMap[iso]) {
-        out.push({
-          date: iso,
-          calories: ovMap[iso].calories,
-          protein_g: ovMap[iso].protein_g,
-          carbs_g: ovMap[iso].carbs_g,
-          fat_g: ovMap[iso].fat_g,
-          source: "override",
-          updated_at: ovMap[iso].updated_at,
-        });
+        out.push({ date: iso, calories: ovMap[iso].calories, protein_g: ovMap[iso].protein_g, carbs_g: ovMap[iso].carbs_g, fat_g: ovMap[iso].fat_g, source: "override", updated_at: ovMap[iso].updated_at });
       } else {
         const key = dayKeyFromISO(iso);
         const base = planMap[key];
-        if (base) {
-          out.push({
-            date: iso,
-            calories: base.calories,
-            protein_g: base.protein_g,
-            carbs_g: base.carbs_g,
-            fat_g: base.fat_g,
-            source: "plan",
-          });
-        }
+        if (base) out.push({ date: iso, calories: base.calories, protein_g: base.protein_g, carbs_g: base.carbs_g, fat_g: base.fat_g, source: "plan" });
       }
     }
 
@@ -456,15 +533,11 @@ app.get("/macro-targets/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, a
   }
 });
 
-// PUT /macro-targets/:athleteId (coach only)
-// body: { entries: [ { date, calories, protein_g, carbs_g, fat_g } ] }
 app.put("/macro-targets/:athleteId", requireAuth, requireCoach, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
     const entries = req.body?.entries;
-    if (!Array.isArray(entries) || entries.length === 0) {
-      return res.status(400).json({ error: "entries must be a non-empty array" });
-    }
+    if (!Array.isArray(entries) || entries.length === 0) return res.status(400).json({ error: "entries must be a non-empty array" });
 
     const ok = await coachOwnsAthlete(req.user.id, athleteId);
     if (!ok) return res.status(404).json({ error: "Athlete not found" });
@@ -475,7 +548,6 @@ app.put("/macro-targets/:athleteId", requireAuth, requireCoach, async (req, res)
       const protein_g = Number(e.protein_g);
       const carbs_g = Number(e.carbs_g);
       const fat_g = Number(e.fat_g);
-
       if (!date || [calories, protein_g, carbs_g, fat_g].some((n) => !Number.isFinite(n) || n < 0)) continue;
 
       await pool.query(
@@ -669,6 +741,73 @@ app.post("/moods/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (r
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// COACH CHECK-IN CALENDAR (links + notes by date)
+app.get("/checkins/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const start = req.query.start ? String(req.query.start) : null;
+    const end = req.query.end ? String(req.query.end) : null;
+
+    let q = `SELECT id, date::text AS date, title, link_url AS \"linkUrl\", notes, created_at
+             FROM coach_checkins
+             WHERE athlete_id = $1`;
+    const params = [athleteId];
+    if (start) { params.push(start); q += ` AND date >= $${params.length}::date`; }
+    if (end) { params.push(end); q += ` AND date <= $${params.length}::date`; }
+    q += ` ORDER BY date ASC, id ASC`;
+
+    const result = await pool.query(q, params);
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("Get checkins error:", err);
+    return res.status(500).json({ error: "Could not fetch check-ins" });
+  }
+});
+
+app.post("/checkins/:athleteId", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const ok = await coachOwnsAthlete(req.user.id, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+
+    const { date, title, linkUrl, notes } = req.body || {};
+    if (!date || typeof date !== "string") return res.status(400).json({ error: "date is required" });
+
+    const t = String(title || "Check-in").slice(0, 120);
+    const l = linkUrl ? String(linkUrl).slice(0, 500) : null;
+    const n = notes ? String(notes).slice(0, 2000) : null;
+
+    const result = await pool.query(
+      `INSERT INTO coach_checkins (athlete_id, date, title, link_url, notes, created_by, created_at)
+       VALUES ($1, $2::date, $3, $4, $5, $6, NOW())
+       RETURNING id, date::text AS date, title, link_url AS \"linkUrl\", notes, created_at`,
+      [athleteId, date, t, l, n, req.user.id]
+    );
+
+    return res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Create checkin error:", err);
+    return res.status(500).json({ error: "Could not create check-in" });
+  }
+});
+
+app.delete("/checkins/:athleteId/:id", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const id = Number(req.params.id);
+    const ok = await coachOwnsAthlete(req.user.id, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+
+    await pool.query('DELETE FROM coach_checkins WHERE id = $1 AND athlete_id = $2', [id, athleteId]);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Delete checkin error:", err);
+    return res.status(500).json({ error: "Could not delete check-in" });
+  }
+});
+
+
+// ─────────────────────────────────────────────────────────────────────────────
 // MEAL PLANS
 // ─────────────────────────────────────────────────────────────────────────────
 app.get("/meal-plans/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
@@ -826,6 +965,19 @@ app.listen(PORT, async () => {
         updated_by INTEGER,
         updated_at TIMESTAMPTZ DEFAULT NOW(),
         PRIMARY KEY (athlete_id, date)
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS coach_checkins (
+        id BIGSERIAL PRIMARY KEY,
+        athlete_id INTEGER NOT NULL,
+        date DATE NOT NULL,
+        title TEXT NOT NULL,
+        link_url TEXT,
+        notes TEXT,
+        created_by INTEGER,
+        created_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
 console.log("✅ DB ready");
