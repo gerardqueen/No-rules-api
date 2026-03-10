@@ -371,11 +371,12 @@ app.post("/daily-totals/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, a
   }
 });
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MACRO TARGETS — calendar/date based (coach -> client) with 6+ month history
-// - Coach can set targets per date (e.g., per week)
-// - Client can read targets by date range
-// - If no override exists for a date, client can still use /macro-plans (day-of-week)
+// - Coach sets targets per date
+// - Client reads targets by date range
+// - Fallback: weekly /macro-plans (day-of-week)
 // ─────────────────────────────────────────────────────────────────────────────
 function dayKeyFromISO(iso) {
   const d = new Date(`${iso}T00:00:00Z`);
@@ -391,12 +392,8 @@ app.get("/macro-targets/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, a
     const start = req.query.start ? String(req.query.start) : null;
     const end = req.query.end ? String(req.query.end) : null;
 
-    if (!start || !end) {
-      // caller must supply a range so we don't generate unbounded calendars
-      return res.status(400).json({ error: "start and end (YYYY-MM-DD) are required" });
-    }
+    if (!start || !end) return res.status(400).json({ error: "start and end (YYYY-MM-DD) are required" });
 
-    // safety: cap range to 370 days
     const startD = new Date(`${start}T00:00:00Z`);
     const endD = new Date(`${end}T00:00:00Z`);
     const days = Math.floor((endD - startD) / 86400000) + 1;
@@ -405,16 +402,14 @@ app.get("/macro-targets/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, a
     }
 
     const overrides = await pool.query(
-      `SELECT date::text AS date, calories, protein_g, carbs_g, fat_g, updated_by, updated_at
+      `SELECT date::text AS date, calories, protein_g, carbs_g, fat_g, updated_at
        FROM macro_targets
        WHERE athlete_id = $1 AND date >= $2::date AND date <= $3::date`,
       [athleteId, start, end]
     );
-
     const ovMap = {};
     overrides.rows.forEach((r) => { ovMap[r.date] = r; });
 
-    // base weekly plan (fallback)
     const plan = await pool.query(
       `SELECT day_of_week, calories, protein_g, carbs_g, fat_g
        FROM macro_plans
@@ -467,7 +462,6 @@ app.put("/macro-targets/:athleteId", requireAuth, requireCoach, async (req, res)
   try {
     const athleteId = Number(req.params.athleteId);
     const entries = req.body?.entries;
-
     if (!Array.isArray(entries) || entries.length === 0) {
       return res.status(400).json({ error: "entries must be a non-empty array" });
     }
