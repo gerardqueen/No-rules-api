@@ -294,6 +294,219 @@ app.put("/macro-plans/:athleteId", requireAuth, requireCoach, async (req, res) =
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// DAILY TOTALS (Macros Consumed) — calendar/date based
+// - Client saves totals per date
+// - Coach reads the same data for 6+ month history
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /daily-totals/:athleteId?start=YYYY-MM-DD&end=YYYY-MM-DD
+app.get("/daily-totals/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const start = req.query.start ? String(req.query.start) : null;
+    const end = req.query.end ? String(req.query.end) : null;
+
+    let q = `SELECT date::text AS date, calories, protein_g, carbs_g, fat_g, note, source, updated_at
+             FROM daily_totals
+             WHERE athlete_id = $1`;
+    const params = [athleteId];
+
+    if (start) { params.push(start); q += ` AND date >= $${params.length}::date`; }
+    if (end) { params.push(end); q += ` AND date <= $${params.length}::date`; }
+
+    q += ` ORDER BY date DESC`;
+
+    const result = await pool.query(q, params);
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("Get daily totals error:", err);
+    return res.status(500).json({ error: "Could not fetch daily totals" });
+  }
+});
+
+// POST /daily-totals/:athleteId
+// body: { date, calories, protein_g, carbs_g, fat_g, note, source }
+app.post("/daily-totals/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const { date, calories, protein_g, carbs_g, fat_g, note, source } = req.body || {};
+
+    if (!date || typeof date !== "string") {
+      return res.status(400).json({ error: "date (YYYY-MM-DD) is required" });
+    }
+
+    const cals = Number(calories);
+    const p = Number(protein_g);
+    const c = Number(carbs_g);
+    const f = Number(fat_g);
+
+    if ([cals, p, c, f].some((n) => !Number.isFinite(n) || n < 0)) {
+      return res.status(400).json({ error: "Invalid macro numbers" });
+    }
+
+    await pool.query(
+      `INSERT INTO daily_totals (athlete_id, date, calories, protein_g, carbs_g, fat_g, note, source, updated_at)
+       VALUES ($1, $2::date, $3, $4, $5, $6, $7, $8, NOW())
+       ON CONFLICT (athlete_id, date)
+       DO UPDATE SET calories = EXCLUDED.calories,
+                     protein_g = EXCLUDED.protein_g,
+                     carbs_g = EXCLUDED.carbs_g,
+                     fat_g = EXCLUDED.fat_g,
+                     note = EXCLUDED.note,
+                     source = EXCLUDED.source,
+                     updated_at = NOW()`,
+      [athleteId, date, cals, p, c, f, note || null, source || "manual"]
+    );
+
+    const result = await pool.query(
+      `SELECT date::text AS date, calories, protein_g, carbs_g, fat_g, note, source, updated_at
+       FROM daily_totals
+       WHERE athlete_id = $1 AND date = $2::date`,
+      [athleteId, date]
+    );
+
+    return res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Save daily totals error:", err);
+    return res.status(500).json({ error: "Could not save daily totals" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MACRO TARGETS — calendar/date based (coach -> client) with 6+ month history
+// - Coach can set targets per date (e.g., per week)
+// - Client can read targets by date range
+// - If no override exists for a date, client can still use /macro-plans (day-of-week)
+// ─────────────────────────────────────────────────────────────────────────────
+function dayKeyFromISO(iso) {
+  const d = new Date(`${iso}T00:00:00Z`);
+  const js = d.getUTCDay(); // 0 Sun
+  const idx = js === 0 ? 6 : js - 1;
+  return VALID_DAYS[idx];
+}
+
+// GET /macro-targets/:athleteId?start=YYYY-MM-DD&end=YYYY-MM-DD
+app.get("/macro-targets/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const start = req.query.start ? String(req.query.start) : null;
+    const end = req.query.end ? String(req.query.end) : null;
+
+    if (!start || !end) {
+      // caller must supply a range so we don't generate unbounded calendars
+      return res.status(400).json({ error: "start and end (YYYY-MM-DD) are required" });
+    }
+
+    // safety: cap range to 370 days
+    const startD = new Date(`${start}T00:00:00Z`);
+    const endD = new Date(`${end}T00:00:00Z`);
+    const days = Math.floor((endD - startD) / 86400000) + 1;
+    if (!Number.isFinite(days) || days <= 0 || days > 370) {
+      return res.status(400).json({ error: "Range too large (max 370 days)" });
+    }
+
+    const overrides = await pool.query(
+      `SELECT date::text AS date, calories, protein_g, carbs_g, fat_g, updated_by, updated_at
+       FROM macro_targets
+       WHERE athlete_id = $1 AND date >= $2::date AND date <= $3::date`,
+      [athleteId, start, end]
+    );
+
+    const ovMap = {};
+    overrides.rows.forEach((r) => { ovMap[r.date] = r; });
+
+    // base weekly plan (fallback)
+    const plan = await pool.query(
+      `SELECT day_of_week, calories, protein_g, carbs_g, fat_g
+       FROM macro_plans
+       WHERE athlete_id = $1`,
+      [athleteId]
+    );
+    const planMap = {};
+    plan.rows.forEach((r) => { planMap[r.day_of_week] = r; });
+
+    const out = [];
+    for (let i = 0; i < days; i++) {
+      const cur = new Date(startD.getTime() + i * 86400000);
+      const iso = cur.toISOString().slice(0, 10);
+      if (ovMap[iso]) {
+        out.push({
+          date: iso,
+          calories: ovMap[iso].calories,
+          protein_g: ovMap[iso].protein_g,
+          carbs_g: ovMap[iso].carbs_g,
+          fat_g: ovMap[iso].fat_g,
+          source: "override",
+          updated_at: ovMap[iso].updated_at,
+        });
+      } else {
+        const key = dayKeyFromISO(iso);
+        const base = planMap[key];
+        if (base) {
+          out.push({
+            date: iso,
+            calories: base.calories,
+            protein_g: base.protein_g,
+            carbs_g: base.carbs_g,
+            fat_g: base.fat_g,
+            source: "plan",
+          });
+        }
+      }
+    }
+
+    return res.json(out);
+  } catch (err) {
+    console.error("Get macro targets error:", err);
+    return res.status(500).json({ error: "Could not fetch macro targets" });
+  }
+});
+
+// PUT /macro-targets/:athleteId (coach only)
+// body: { entries: [ { date, calories, protein_g, carbs_g, fat_g } ] }
+app.put("/macro-targets/:athleteId", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const entries = req.body?.entries;
+
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return res.status(400).json({ error: "entries must be a non-empty array" });
+    }
+
+    const ok = await coachOwnsAthlete(req.user.id, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+
+    for (const e of entries) {
+      const date = String(e.date || "");
+      const calories = Number(e.calories);
+      const protein_g = Number(e.protein_g);
+      const carbs_g = Number(e.carbs_g);
+      const fat_g = Number(e.fat_g);
+
+      if (!date || [calories, protein_g, carbs_g, fat_g].some((n) => !Number.isFinite(n) || n < 0)) continue;
+
+      await pool.query(
+        `INSERT INTO macro_targets (athlete_id, date, calories, protein_g, carbs_g, fat_g, updated_by, updated_at)
+         VALUES ($1, $2::date, $3, $4, $5, $6, $7, NOW())
+         ON CONFLICT (athlete_id, date)
+         DO UPDATE SET calories = EXCLUDED.calories,
+                       protein_g = EXCLUDED.protein_g,
+                       carbs_g = EXCLUDED.carbs_g,
+                       fat_g = EXCLUDED.fat_g,
+                       updated_by = EXCLUDED.updated_by,
+                       updated_at = NOW()`,
+        [athleteId, date, calories, protein_g, carbs_g, fat_g, req.user.id]
+      );
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Save macro targets error:", err);
+    return res.status(500).json({ error: "Could not save macro targets" });
+  }
+});
+
+
+// ─────────────────────────────────────────────────────────────────────────────
 // PROFILES
 // ─────────────────────────────────────────────────────────────────────────────
 app.get("/profiles/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
@@ -591,7 +804,37 @@ app.listen(PORT, async () => {
       );
     `);
 
-    console.log("✅ DB ready");
+    
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS daily_totals (
+        athlete_id INTEGER NOT NULL,
+        date DATE NOT NULL,
+        calories INTEGER NOT NULL DEFAULT 0,
+        protein_g INTEGER NOT NULL DEFAULT 0,
+        carbs_g INTEGER NOT NULL DEFAULT 0,
+        fat_g INTEGER NOT NULL DEFAULT 0,
+        note TEXT,
+        source TEXT DEFAULT 'manual',
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (athlete_id, date)
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS macro_targets (
+        athlete_id INTEGER NOT NULL,
+        date DATE NOT NULL,
+        calories INTEGER NOT NULL DEFAULT 0,
+        protein_g INTEGER NOT NULL DEFAULT 0,
+        carbs_g INTEGER NOT NULL DEFAULT 0,
+        fat_g INTEGER NOT NULL DEFAULT 0,
+        updated_by INTEGER,
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (athlete_id, date)
+      );
+    `);
+console.log("✅ DB ready");
   } catch (err) {
     console.error("❌ Auto-migration error:", err.message);
   }
