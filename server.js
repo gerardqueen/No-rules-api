@@ -849,6 +849,142 @@ app.put("/meal-plans/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, asyn
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FOOD LOGS (Manual foods + per-item macros) — date based
+// Stores the list of foods logged for a day so the UI can rebuild the diary on re-login.
+//
+// Shape: { date:'YYYY-MM-DD', foods:[{ id, name, grams, calories, protein_g, carbs_g, fat_g, source, created_at }] }
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/food-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const start = req.query.start ? String(req.query.start) : null;
+    const end = req.query.end ? String(req.query.end) : null;
+
+    let q = `SELECT date::text AS date, foods, updated_at
+             FROM food_logs
+             WHERE athlete_id = $1`;
+    const params = [athleteId];
+    if (start) { params.push(start); q += ` AND date >= $${params.length}::date`; }
+    if (end) { params.push(end); q += ` AND date <= $${params.length}::date`; }
+    q += ` ORDER BY date DESC`;
+
+    const result = await pool.query(q, params);
+    return res.json(result.rows.map(r => ({ ...r, foods: r.foods || [] })));
+  } catch (err) {
+    console.error("Get food logs error:", err);
+    return res.status(500).json({ error: "Could not fetch food logs" });
+  }
+});
+
+app.put("/food-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const { date, foods } = req.body || {};
+    if (!date || typeof date !== "string") return res.status(400).json({ error: "date (YYYY-MM-DD) is required" });
+    if (!Array.isArray(foods)) return res.status(400).json({ error: "foods must be an array" });
+
+    // Normalize items a bit
+    const norm = foods.map((f) => ({
+      id: f.id || null,
+      name: String(f.name || "").slice(0, 120),
+      grams: Number(f.grams || 0),
+      calories: Number(f.calories || 0),
+      protein_g: Number(f.protein_g ?? f.protein ?? 0),
+      carbs_g: Number(f.carbs_g ?? f.carbs ?? 0),
+      fat_g: Number(f.fat_g ?? f.fat ?? 0),
+      source: String(f.source || "manual").slice(0, 24),
+      created_at: f.created_at || null,
+    }));
+
+    await pool.query(
+      `INSERT INTO food_logs (athlete_id, date, foods, updated_by, updated_at)
+       VALUES ($1, $2::date, $3::jsonb, $4, NOW())
+       ON CONFLICT (athlete_id, date)
+       DO UPDATE SET foods = EXCLUDED.foods, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+      [athleteId, date, JSON.stringify(norm), req.user.id]
+    );
+
+    const result = await pool.query(
+      `SELECT date::text AS date, foods, updated_at
+       FROM food_logs
+       WHERE athlete_id=$1 AND date=$2::date`,
+      [athleteId, date]
+    );
+
+    return res.json({ ...result.rows[0], foods: result.rows[0]?.foods || [] });
+  } catch (err) {
+    console.error("Save food logs error:", err);
+    return res.status(500).json({ error: "Could not save food logs" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CALENDAR EVENTS (Athlete-created + coach-created) — date/time based
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/calendar-events/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const start = req.query.start ? String(req.query.start) : null;
+    const end = req.query.end ? String(req.query.end) : null;
+
+    let q = `SELECT id, date::text AS date, title, start_iso AS "startISO", end_iso AS "endISO", notes, created_by AS "createdBy", created_at
+             FROM calendar_events
+             WHERE athlete_id = $1`;
+    const params = [athleteId];
+    if (start) { params.push(start); q += ` AND date >= $${params.length}::date`; }
+    if (end) { params.push(end); q += ` AND date <= $${params.length}::date`; }
+    q += ` ORDER BY date ASC, start_iso ASC, id ASC`;
+
+    const result = await pool.query(q, params);
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("Get calendar events error:", err);
+    return res.status(500).json({ error: "Could not fetch calendar events" });
+  }
+});
+
+app.post("/calendar-events/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const { date, title, startISO, endISO, notes } = req.body || {};
+    if (!date || typeof date !== "string") return res.status(400).json({ error: "date (YYYY-MM-DD) is required" });
+    if (!title) return res.status(400).json({ error: "title is required" });
+
+    const t = String(title).slice(0, 120);
+    const s = startISO ? String(startISO).slice(0, 32) : null;
+    const e = endISO ? String(endISO).slice(0, 32) : null;
+    const n = notes ? String(notes).slice(0, 2000) : null;
+
+    const result = await pool.query(
+      `INSERT INTO calendar_events (athlete_id, date, title, start_iso, end_iso, notes, created_by, created_at)
+       VALUES ($1, $2::date, $3, $4, $5, $6, $7, NOW())
+       RETURNING id, date::text AS date, title, start_iso AS "startISO", end_iso AS "endISO", notes, created_by AS "createdBy", created_at`,
+      [athleteId, date, t, s, e, n, req.user.id]
+    );
+    return res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Create calendar event error:", err);
+    return res.status(500).json({ error: "Could not create calendar event" });
+  }
+});
+
+app.delete("/calendar-events/:athleteId/:id", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid event id" });
+
+    // allow deletion if self or coach of athlete (already checked)
+    await pool.query(`DELETE FROM calendar_events WHERE athlete_id=$1 AND id=$2`, [athleteId, id]);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Delete calendar event error:", err);
+    return res.status(500).json({ error: "Could not delete calendar event" });
+  }
+});
+
 // HEALTH
 // ─────────────────────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
@@ -980,6 +1116,30 @@ app.listen(PORT, async () => {
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
+
+ await pool.query(`
+ CREATE TABLE IF NOT EXISTS food_logs (
+   athlete_id INTEGER NOT NULL,
+   date DATE NOT NULL,
+   foods JSONB NOT NULL DEFAULT '[]'::jsonb,
+   updated_by INTEGER,
+   updated_at TIMESTAMPTZ DEFAULT NOW(),
+   PRIMARY KEY (athlete_id, date)
+ );
+ `);
+ await pool.query(`
+ CREATE TABLE IF NOT EXISTS calendar_events (
+   id BIGSERIAL PRIMARY KEY,
+   athlete_id INTEGER NOT NULL,
+   date DATE NOT NULL,
+   title TEXT NOT NULL,
+   start_iso TEXT,
+   end_iso TEXT,
+   notes TEXT,
+   created_by INTEGER,
+   created_at TIMESTAMPTZ DEFAULT NOW()
+ );
+ `);
 console.log("✅ DB ready");
   } catch (err) {
     console.error("❌ Auto-migration error:", err.message);
