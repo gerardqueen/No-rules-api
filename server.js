@@ -985,6 +985,57 @@ app.delete("/calendar-events/:athleteId/:id", requireAuth, requireSelfOrCoachOfA
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ATHLETE SUMMARY — combined macro goals + week plan (athlete-facing)
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/athlete/:athleteId/macro-targets", requireAuth, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    if (req.user?.id !== athleteId) return res.status(403).json({ error: "Forbidden" });
+
+    const plan = await pool.query(
+      `SELECT day_of_week, calories, protein_g, carbs_g, fat_g
+       FROM macro_plans WHERE athlete_id = $1`, [athleteId]);
+
+    if (!plan.rows.length) return res.json({});
+
+    const sum = plan.rows.reduce((a, r) => ({
+      calories: a.calories + Number(r.calories || 0),
+      protein: a.protein + Number(r.protein_g || 0),
+      carbs: a.carbs + Number(r.carbs_g || 0),
+      fat: a.fat + Number(r.fat_g || 0),
+    }), { calories: 0, protein: 0, carbs: 0, fat: 0 });
+    const n = Math.max(1, plan.rows.length);
+    const macroGoals = {
+      calories: Math.round(sum.calories / n),
+      protein: Math.round(sum.protein / n),
+      carbs: Math.round(sum.carbs / n),
+      fat: Math.round(sum.fat / n),
+    };
+    return res.json({ macroGoals });
+  } catch (err) {
+    console.error("Athlete macro targets error:", err);
+    return res.status(500).json({ error: "Could not fetch macro targets" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ATHLETE CALENDAR EVENTS (athlete-facing, legacy path)
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/athlete/:athleteId/calendar-events", requireAuth, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    if (req.user?.id !== athleteId) return res.status(403).json({ error: "Forbidden" });
+    const result = await pool.query(
+      `SELECT id, date::text AS date, title, start_iso AS "startISO", end_iso AS "endISO", notes, created_by AS "createdBy"
+       FROM calendar_events WHERE athlete_id = $1 ORDER BY date ASC, id ASC`, [athleteId]);
+    return res.json({ events: result.rows });
+  } catch (err) {
+    console.error("Athlete calendar events error:", err);
+    return res.status(500).json({ error: "Could not fetch events" });
+  }
+});
+
 // HEALTH
 // ─────────────────────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
