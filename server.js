@@ -630,6 +630,10 @@ app.put("/profiles/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async 
     );
 
     const row = result.rows[0];
+    // Also sync mfp_username to users table so it appears in athlete listings
+    if (mfpUsername !== undefined) {
+      try { await pool.query(`UPDATE users SET mfp_username=$1 WHERE id=$2`, [mfpUsername || null, athleteId]); } catch {}
+    }
     return res.json({
       athleteId: row.athlete_id,
       goal: row.goal,
