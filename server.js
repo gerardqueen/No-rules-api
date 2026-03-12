@@ -1062,12 +1062,37 @@ app.delete("/admin/coaches/:coachId", requireAuth, requireAdmin, async (req, res
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// MESSAGES — ensure table exists (called before every messages query)
+// ─────────────────────────────────────────────────────────────────────────────
+let messagesTableReady = false;
+async function ensureMessagesTable() {
+  if (messagesTableReady) return;
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS messages (
+        id BIGSERIAL PRIMARY KEY,
+        from_id INTEGER NOT NULL,
+        to_id INTEGER NOT NULL,
+        content TEXT NOT NULL,
+        is_read BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    messagesTableReady = true;
+  } catch (e) {
+    // Table might exist with old 'read' column — that's fine, queries handle both
+    messagesTableReady = true;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // MESSAGES (coach <-> athlete)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Broadcast from coach to all their athletes (MUST be before :toId route)
 app.post("/messages/broadcast", requireAuth, requireCoach, async (req, res) => {
   try {
+    await ensureMessagesTable();
     const coachId = req.user.id;
     const { content } = req.body || {};
     if (!content || typeof content !== "string" || !content.trim()) {
@@ -1096,6 +1121,7 @@ app.post("/messages/broadcast", requireAuth, requireCoach, async (req, res) => {
 // Admin broadcast to ALL athletes across all coaches
 app.post("/messages/broadcast-all", requireAuth, requireAdmin, async (req, res) => {
   try {
+    await ensureMessagesTable();
     const adminId = req.user.id;
     const { content } = req.body || {};
     if (!content || typeof content !== "string" || !content.trim()) {
@@ -1123,6 +1149,7 @@ app.post("/messages/broadcast-all", requireAuth, requireAdmin, async (req, res) 
 // Unread count for current user
 app.get("/messages-unread", requireAuth, async (req, res) => {
   try {
+    await ensureMessagesTable();
     // Try is_read first, fall back to "read"
     let result;
     try {
@@ -1144,6 +1171,7 @@ app.get("/messages-unread", requireAuth, async (req, res) => {
 
 app.get("/messages/:otherId", requireAuth, async (req, res) => {
   try {
+    await ensureMessagesTable();
     const me = req.user.id;
     const other = Number(req.params.otherId);
     // Don't select read column at all — avoids reserved word issues
@@ -1166,6 +1194,7 @@ app.get("/messages/:otherId", requireAuth, async (req, res) => {
 
 app.post("/messages/:toId", requireAuth, async (req, res) => {
   try {
+    await ensureMessagesTable();
     const fromId = req.user.id;
     const toId = Number(req.params.toId);
     const { content } = req.body || {};
@@ -1473,27 +1502,7 @@ app.listen(PORT, async () => {
    created_at TIMESTAMPTZ DEFAULT NOW()
  );
  `);
- // Messages table — drop old version if column schema is wrong, then create fresh
- try {
-   const colCheck = await pool.query(
-     `SELECT column_name FROM information_schema.columns WHERE table_name='messages' AND column_name='read'`
-   );
-   if (colCheck.rows.length > 0) {
-     // Old schema with reserved-word column — drop and recreate
-     await pool.query(`DROP TABLE messages`);
-     console.log("⚠️  Dropped old messages table (had reserved 'read' column)");
-   }
- } catch (e) { /* table might not exist yet, that's fine */ }
- await pool.query(`
- CREATE TABLE IF NOT EXISTS messages (
-   id BIGSERIAL PRIMARY KEY,
-   from_id INTEGER NOT NULL,
-   to_id INTEGER NOT NULL,
-   content TEXT NOT NULL,
-   is_read BOOLEAN DEFAULT FALSE,
-   created_at TIMESTAMPTZ DEFAULT NOW()
- );
- `);
+ // Messages table created on-demand via ensureMessagesTable() helper
 console.log("✅ DB ready");
 
     // Promote known coach accounts to admin
