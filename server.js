@@ -44,10 +44,20 @@ function requireAuth(req, res, next) {
 }
 
 function requireCoach(req, res, next) {
-  if (req.user?.role !== "coach") {
+  if (req.user?.role !== "coach" && req.user?.role !== "admin") {
     return res.status(403).json({ error: "Coach access required" });
   }
   return next();
+}
+
+async function requireAdmin(req, res, next) {
+  // Check JWT role first; fall back to DB for freshness after role migrations
+  if (req.user?.role === "admin") return next();
+  try {
+    const r = await pool.query("SELECT role FROM users WHERE id = $1", [req.user?.id]);
+    if (r.rows[0]?.role === "admin") return next();
+  } catch {}
+  return res.status(403).json({ error: "Admin access required" });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -129,7 +139,7 @@ const VALID_DAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
 
 async function coachOwnsAthlete(coachId, athleteId) {
   const r = await pool.query(
-    `SELECT id FROM users WHERE id = $1 AND coach_id = $2 AND role <> 'coach'`,
+    `SELECT id FROM users WHERE id = $1 AND coach_id = $2 AND role NOT IN ('coach','admin')`,
     [athleteId, coachId]
   );
   return !!r.rows[0];
@@ -145,8 +155,8 @@ async function requireSelfOrCoachOfAthlete(req, res, next) {
     // ✅ any logged-in user can access their own records
     if (req.user?.id === athleteId) return next();
 
-    // ✅ coaches can access users assigned to them
-    if (req.user?.role === "coach") {
+    // ✅ coaches/admins can access users assigned to them
+    if (req.user?.role === "coach" || req.user?.role === "admin") {
       const ok = await coachOwnsAthlete(req.user.id, athleteId);
       if (!ok) return res.status(404).json({ error: "Athlete not found" });
       return next();
@@ -167,7 +177,7 @@ app.get("/athletes", requireAuth, requireCoach, async (req, res) => {
     const result = await pool.query(
       `SELECT id, email, name, role, sport, mfp_username, avatar_url, created_at
        FROM users
-       WHERE coach_id = $1 AND role <> 'coach'
+       WHERE coach_id = $1 AND role NOT IN ('coach','admin')
        ORDER BY name ASC`,
       [req.user.id]
     );
@@ -312,7 +322,7 @@ app.delete("/athletes/:athleteId", requireAuth, requireCoach, async (req, res) =
       await client.query('DELETE FROM meal_plans WHERE athlete_id = $1', [athleteId]);
       await client.query('DELETE FROM profiles WHERE athlete_id = $1', [athleteId]);
       await client.query('DELETE FROM macro_plans WHERE athlete_id = $1', [athleteId]);
-      await client.query("DELETE FROM users WHERE id = $1 AND coach_id = $2 AND role <> 'coach'", [athleteId, req.user.id]);
+      await client.query("DELETE FROM users WHERE id = $1 AND coach_id = $2 AND role NOT IN ('coach','admin')", [athleteId, req.user.id]);
       await client.query('COMMIT');
       return res.json({ ok: true });
     } catch (err) {
@@ -986,6 +996,72 @@ app.delete("/calendar-events/:athleteId/:id", requireAuth, requireSelfOrCoachOfA
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ADMIN — Coach management (admin only)
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/admin/coaches", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, email, name, role, sport, avatar_url, created_at
+       FROM users
+       WHERE role IN ('coach','admin')
+       ORDER BY name ASC`
+    );
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("Get coaches error:", err);
+    return res.status(500).json({ error: "Could not fetch coaches" });
+  }
+});
+
+app.post("/admin/coaches", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { email, name, password, role } = req.body || {};
+    if (!email || !name || !password) {
+      return res.status(400).json({ error: "Email, name and password are required" });
+    }
+    const existing = await pool.query("SELECT id FROM users WHERE email = $1", [
+      String(email).toLowerCase().trim(),
+    ]);
+    if (existing.rows[0]) {
+      return res.status(409).json({ error: "An account with that email already exists" });
+    }
+    const passwordHash = await bcrypt.hash(password, 12);
+    const coachRole = role === "admin" ? "admin" : "coach";
+    const result = await pool.query(
+      `INSERT INTO users (email, password_hash, name, role, created_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       RETURNING id, email, name, role, created_at`,
+      [String(email).toLowerCase().trim(), passwordHash, name, coachRole]
+    );
+    return res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error("Create coach error:", err);
+    return res.status(500).json({ error: "Could not create coach" });
+  }
+});
+
+app.delete("/admin/coaches/:coachId", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const coachId = Number(req.params.coachId);
+    if (!Number.isInteger(coachId) || coachId <= 0) return res.status(400).json({ error: "Invalid coach id" });
+    // Don't let admin delete themselves
+    if (coachId === req.user.id) return res.status(400).json({ error: "Cannot delete your own account" });
+    // Check the target is actually a coach/admin
+    const check = await pool.query("SELECT role FROM users WHERE id = $1", [coachId]);
+    if (!check.rows[0] || !['coach','admin'].includes(check.rows[0].role)) {
+      return res.status(404).json({ error: "Coach not found" });
+    }
+    // Unassign athletes (set coach_id to null) rather than deleting them
+    await pool.query("UPDATE users SET coach_id = NULL WHERE coach_id = $1", [coachId]);
+    await pool.query("DELETE FROM users WHERE id = $1", [coachId]);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Delete coach error:", err);
+    return res.status(500).json({ error: "Could not delete coach" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ATHLETE SUMMARY — combined macro goals + week plan (athlete-facing)
 // ─────────────────────────────────────────────────────────────────────────────
 app.get("/athlete/:athleteId/macro-targets", requireAuth, async (req, res) => {
@@ -1192,6 +1268,12 @@ app.listen(PORT, async () => {
  );
  `);
 console.log("✅ DB ready");
+
+    // Promote known coach accounts to admin
+    await pool.query(
+      `UPDATE users SET role = 'admin' WHERE email IN ('gerard@norules.com','luke@norules.com','esme@norules.com') AND role = 'coach'`
+    );
+    console.log("✅ Admin accounts set");
   } catch (err) {
     console.error("❌ Auto-migration error:", err.message);
   }
