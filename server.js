@@ -1123,12 +1123,19 @@ app.post("/messages/broadcast-all", requireAuth, requireAdmin, async (req, res) 
 // Unread count for current user
 app.get("/messages-unread", requireAuth, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT from_id AS "fromId", COUNT(*)::int AS count
-       FROM messages WHERE to_id=$1 AND is_read=FALSE
-       GROUP BY from_id`,
-      [req.user.id]
-    );
+    // Try is_read first, fall back to "read"
+    let result;
+    try {
+      result = await pool.query(
+        `SELECT from_id AS "fromId", COUNT(*)::int AS count FROM messages WHERE to_id=$1 AND is_read=FALSE GROUP BY from_id`,
+        [req.user.id]
+      );
+    } catch {
+      result = await pool.query(
+        `SELECT from_id AS "fromId", COUNT(*)::int AS count FROM messages WHERE to_id=$1 AND "read"=FALSE GROUP BY from_id`,
+        [req.user.id]
+      );
+    }
     return res.json(result.rows);
   } catch (err) {
     return res.status(500).json({ error: "Could not fetch unread counts" });
@@ -1139,18 +1146,17 @@ app.get("/messages/:otherId", requireAuth, async (req, res) => {
   try {
     const me = req.user.id;
     const other = Number(req.params.otherId);
+    // Don't select read column at all — avoids reserved word issues
     const result = await pool.query(
-      `SELECT id, from_id AS "fromId", to_id AS "toId", content, is_read AS "read", created_at
+      `SELECT id, from_id AS "fromId", to_id AS "toId", content, created_at
        FROM messages
        WHERE (from_id=$1 AND to_id=$2) OR (from_id=$2 AND to_id=$1)
        ORDER BY created_at ASC`,
       [me, other]
     );
-    // Mark messages TO me as read
-    await pool.query(
-      `UPDATE messages SET is_read=TRUE WHERE from_id=$1 AND to_id=$2 AND is_read=FALSE`,
-      [other, me]
-    );
+    // Mark messages TO me as read — try both column names
+    try { await pool.query(`UPDATE messages SET is_read=TRUE WHERE from_id=$1 AND to_id=$2 AND is_read=FALSE`, [other, me]); }
+    catch { try { await pool.query(`UPDATE messages SET "read"=TRUE WHERE from_id=$1 AND to_id=$2 AND "read"=FALSE`, [other, me]); } catch {} }
     return res.json(result.rows);
   } catch (err) {
     console.error("Get messages error:", err);
@@ -1169,7 +1175,7 @@ app.post("/messages/:toId", requireAuth, async (req, res) => {
     const result = await pool.query(
       `INSERT INTO messages (from_id, to_id, content, created_at)
        VALUES ($1, $2, $3, NOW())
-       RETURNING id, from_id AS "fromId", to_id AS "toId", content, is_read AS "read", created_at`,
+       RETURNING id, from_id AS "fromId", to_id AS "toId", content, created_at`,
       [fromId, toId, content.trim().slice(0, 5000)]
     );
     return res.json(result.rows[0]);
