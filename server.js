@@ -1062,6 +1062,179 @@ app.delete("/admin/coaches/:coachId", requireAuth, requireAdmin, async (req, res
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// MESSAGES (coach <-> athlete)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Broadcast from coach to all their athletes (MUST be before :toId route)
+app.post("/messages/broadcast", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const coachId = req.user.id;
+    const { content } = req.body || {};
+    if (!content || typeof content !== "string" || !content.trim()) {
+      return res.status(400).json({ error: "Message content is required" });
+    }
+    const athletes = await pool.query(
+      `SELECT id FROM users WHERE coach_id=$1 AND role NOT IN ('coach','admin')`,
+      [coachId]
+    );
+    const msg = content.trim().slice(0, 5000);
+    let sent = 0;
+    for (const a of athletes.rows) {
+      await pool.query(
+        `INSERT INTO messages (from_id, to_id, content, created_at) VALUES ($1,$2,$3,NOW())`,
+        [coachId, a.id, msg]
+      );
+      sent++;
+    }
+    return res.json({ ok: true, sent });
+  } catch (err) {
+    console.error("Broadcast error:", err);
+    return res.status(500).json({ error: "Could not broadcast" });
+  }
+});
+
+// Unread count for current user
+app.get("/messages-unread", requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT from_id AS "fromId", COUNT(*)::int AS count
+       FROM messages WHERE to_id=$1 AND read=FALSE
+       GROUP BY from_id`,
+      [req.user.id]
+    );
+    return res.json(result.rows);
+  } catch (err) {
+    return res.status(500).json({ error: "Could not fetch unread counts" });
+  }
+});
+
+app.get("/messages/:otherId", requireAuth, async (req, res) => {
+  try {
+    const me = req.user.id;
+    const other = Number(req.params.otherId);
+    const result = await pool.query(
+      `SELECT id, from_id AS "fromId", to_id AS "toId", content, read, created_at
+       FROM messages
+       WHERE (from_id=$1 AND to_id=$2) OR (from_id=$2 AND to_id=$1)
+       ORDER BY created_at ASC`,
+      [me, other]
+    );
+    // Mark messages TO me as read
+    await pool.query(
+      `UPDATE messages SET read=TRUE WHERE from_id=$1 AND to_id=$2 AND read=FALSE`,
+      [other, me]
+    );
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("Get messages error:", err);
+    return res.status(500).json({ error: "Could not fetch messages" });
+  }
+});
+
+app.post("/messages/:toId", requireAuth, async (req, res) => {
+  try {
+    const fromId = req.user.id;
+    const toId = Number(req.params.toId);
+    const { content } = req.body || {};
+    if (!content || typeof content !== "string" || !content.trim()) {
+      return res.status(400).json({ error: "Message content is required" });
+    }
+    const result = await pool.query(
+      `INSERT INTO messages (from_id, to_id, content, created_at)
+       VALUES ($1, $2, $3, NOW())
+       RETURNING id, from_id AS "fromId", to_id AS "toId", content, read, created_at`,
+      [fromId, toId, content.trim().slice(0, 5000)]
+    );
+    return res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Send message error:", err);
+    return res.status(500).json({ error: "Could not send message" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADMIN — Coach overview with stats + reassign athletes
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/admin/coach-overview", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const coaches = await pool.query(
+      `SELECT id, email, name, role FROM users WHERE role IN ('coach','admin') ORDER BY name`
+    );
+    const out = [];
+    for (const c of coaches.rows) {
+      const athleteCount = await pool.query(
+        `SELECT COUNT(*)::int AS count FROM users WHERE coach_id=$1 AND role NOT IN ('coach','admin')`,
+        [c.id]
+      );
+      // Average adherence for last 14 days
+      const adherQ = await pool.query(
+        `WITH dt AS (
+           SELECT dt.athlete_id, dt.date, dt.calories AS consumed,
+                  COALESCE(mp.calories, 2000) AS target
+           FROM daily_totals dt
+           JOIN users u ON u.id = dt.athlete_id AND u.coach_id = $1
+           LEFT JOIN macro_plans mp ON mp.athlete_id = dt.athlete_id AND mp.day_of_week = (
+             CASE EXTRACT(DOW FROM dt.date)
+               WHEN 0 THEN 'SUN' WHEN 1 THEN 'MON' WHEN 2 THEN 'TUE' WHEN 3 THEN 'WED'
+               WHEN 4 THEN 'THU' WHEN 5 THEN 'FRI' WHEN 6 THEN 'SAT' END)
+           WHERE dt.date >= CURRENT_DATE - INTERVAL '14 days'
+         )
+         SELECT COUNT(*)::int AS total,
+                SUM(CASE WHEN target>0 AND ABS(consumed-target)/target<=0.15 THEN 1 ELSE 0 END)::int AS adhered
+         FROM dt WHERE target>0`,
+        [c.id]
+      );
+      const total = adherQ.rows[0]?.total ?? 0;
+      const adhered = adherQ.rows[0]?.adhered ?? 0;
+      const adherencePct = total > 0 ? Math.round((adhered / total) * 100) : null;
+
+      out.push({
+        id: c.id, name: c.name, email: c.email, role: c.role,
+        athleteCount: athleteCount.rows[0]?.count ?? 0,
+        adherencePct,
+      });
+    }
+    return res.json(out);
+  } catch (err) {
+    console.error("Coach overview error:", err);
+    return res.status(500).json({ error: "Could not fetch overview" });
+  }
+});
+
+// Get athletes for a specific coach (admin view)
+app.get("/admin/coach/:coachId/athletes", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const coachId = Number(req.params.coachId);
+    const result = await pool.query(
+      `SELECT id, email, name, sport FROM users WHERE coach_id=$1 AND role NOT IN ('coach','admin') ORDER BY name`,
+      [coachId]
+    );
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("Coach athletes error:", err);
+    return res.status(500).json({ error: "Could not fetch athletes" });
+  }
+});
+
+// Reassign athlete to different coach
+app.put("/admin/reassign", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { athleteId, newCoachId } = req.body || {};
+    if (!athleteId || !newCoachId) return res.status(400).json({ error: "athleteId and newCoachId required" });
+    // Verify target is a coach/admin
+    const coach = await pool.query("SELECT id, role FROM users WHERE id=$1", [newCoachId]);
+    if (!coach.rows[0] || !['coach','admin'].includes(coach.rows[0].role)) {
+      return res.status(404).json({ error: "Target coach not found" });
+    }
+    await pool.query("UPDATE users SET coach_id=$1 WHERE id=$2", [newCoachId, athleteId]);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Reassign error:", err);
+    return res.status(500).json({ error: "Could not reassign athlete" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ATHLETE SUMMARY — combined macro goals + week plan (athlete-facing)
 // ─────────────────────────────────────────────────────────────────────────────
 app.get("/athlete/:athleteId/macro-targets", requireAuth, async (req, res) => {
@@ -1264,6 +1437,16 @@ app.listen(PORT, async () => {
    end_iso TEXT,
    notes TEXT,
    created_by INTEGER,
+   created_at TIMESTAMPTZ DEFAULT NOW()
+ );
+ `);
+ await pool.query(`
+ CREATE TABLE IF NOT EXISTS messages (
+   id BIGSERIAL PRIMARY KEY,
+   from_id INTEGER NOT NULL,
+   to_id INTEGER NOT NULL,
+   content TEXT NOT NULL,
+   read BOOLEAN DEFAULT FALSE,
    created_at TIMESTAMPTZ DEFAULT NOW()
  );
  `);
