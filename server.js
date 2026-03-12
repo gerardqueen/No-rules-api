@@ -1093,6 +1093,33 @@ app.post("/messages/broadcast", requireAuth, requireCoach, async (req, res) => {
   }
 });
 
+// Admin broadcast to ALL athletes across all coaches
+app.post("/messages/broadcast-all", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const adminId = req.user.id;
+    const { content } = req.body || {};
+    if (!content || typeof content !== "string" || !content.trim()) {
+      return res.status(400).json({ error: "Message content is required" });
+    }
+    const athletes = await pool.query(
+      `SELECT id FROM users WHERE role NOT IN ('coach','admin')`
+    );
+    const msg = content.trim().slice(0, 5000);
+    let sent = 0;
+    for (const a of athletes.rows) {
+      await pool.query(
+        `INSERT INTO messages (from_id, to_id, content, created_at) VALUES ($1,$2,$3,NOW())`,
+        [adminId, a.id, msg]
+      );
+      sent++;
+    }
+    return res.json({ ok: true, sent });
+  } catch (err) {
+    console.error("Broadcast-all error:", err);
+    return res.status(500).json({ error: "Could not broadcast to all" });
+  }
+});
+
 // Unread count for current user
 app.get("/messages-unread", requireAuth, async (req, res) => {
   try {
