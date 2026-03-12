@@ -1068,8 +1068,15 @@ let messagesTableReady = false;
 async function ensureMessagesTable() {
   if (messagesTableReady) return;
   try {
+    // Verify the table has the right columns by testing a simple query
+    await pool.query(`SELECT from_id, to_id, content FROM messages LIMIT 0`);
+    messagesTableReady = true;
+  } catch (e) {
+    // Table missing or wrong schema — drop and recreate
+    console.log("⚠️  Messages table missing or wrong schema, recreating...");
+    try { await pool.query(`DROP TABLE IF EXISTS messages`); } catch {}
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS messages (
+      CREATE TABLE messages (
         id BIGSERIAL PRIMARY KEY,
         from_id INTEGER NOT NULL,
         to_id INTEGER NOT NULL,
@@ -1078,9 +1085,7 @@ async function ensureMessagesTable() {
         created_at TIMESTAMPTZ DEFAULT NOW()
       )
     `);
-    messagesTableReady = true;
-  } catch (e) {
-    // Table might exist with old 'read' column — that's fine, queries handle both
+    console.log("✅ Messages table created");
     messagesTableReady = true;
   }
 }
