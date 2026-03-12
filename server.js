@@ -1467,6 +1467,17 @@ app.listen(PORT, async () => {
    created_at TIMESTAMPTZ DEFAULT NOW()
  );
  `);
+ // Messages table — drop old version if column schema is wrong, then create fresh
+ try {
+   const colCheck = await pool.query(
+     `SELECT column_name FROM information_schema.columns WHERE table_name='messages' AND column_name='read'`
+   );
+   if (colCheck.rows.length > 0) {
+     // Old schema with reserved-word column — drop and recreate
+     await pool.query(`DROP TABLE messages`);
+     console.log("⚠️  Dropped old messages table (had reserved 'read' column)");
+   }
+ } catch (e) { /* table might not exist yet, that's fine */ }
  await pool.query(`
  CREATE TABLE IF NOT EXISTS messages (
    id BIGSERIAL PRIMARY KEY,
@@ -1477,10 +1488,6 @@ app.listen(PORT, async () => {
    created_at TIMESTAMPTZ DEFAULT NOW()
  );
  `);
- // Migrate: rename 'read' column to 'is_read' if old schema exists
- try {
-   await pool.query(`ALTER TABLE messages RENAME COLUMN "read" TO is_read`);
- } catch (e) { /* column already renamed or doesn't exist */ }
 console.log("✅ DB ready");
 
     // Promote known coach accounts to admin
