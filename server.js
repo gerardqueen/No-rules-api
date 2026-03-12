@@ -1098,7 +1098,7 @@ app.get("/messages-unread", requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT from_id AS "fromId", COUNT(*)::int AS count
-       FROM messages WHERE to_id=$1 AND read=FALSE
+       FROM messages WHERE to_id=$1 AND is_read=FALSE
        GROUP BY from_id`,
       [req.user.id]
     );
@@ -1113,7 +1113,7 @@ app.get("/messages/:otherId", requireAuth, async (req, res) => {
     const me = req.user.id;
     const other = Number(req.params.otherId);
     const result = await pool.query(
-      `SELECT id, from_id AS "fromId", to_id AS "toId", content, read, created_at
+      `SELECT id, from_id AS "fromId", to_id AS "toId", content, is_read AS "read", created_at
        FROM messages
        WHERE (from_id=$1 AND to_id=$2) OR (from_id=$2 AND to_id=$1)
        ORDER BY created_at ASC`,
@@ -1121,7 +1121,7 @@ app.get("/messages/:otherId", requireAuth, async (req, res) => {
     );
     // Mark messages TO me as read
     await pool.query(
-      `UPDATE messages SET read=TRUE WHERE from_id=$1 AND to_id=$2 AND read=FALSE`,
+      `UPDATE messages SET is_read=TRUE WHERE from_id=$1 AND to_id=$2 AND is_read=FALSE`,
       [other, me]
     );
     return res.json(result.rows);
@@ -1142,7 +1142,7 @@ app.post("/messages/:toId", requireAuth, async (req, res) => {
     const result = await pool.query(
       `INSERT INTO messages (from_id, to_id, content, created_at)
        VALUES ($1, $2, $3, NOW())
-       RETURNING id, from_id AS "fromId", to_id AS "toId", content, read, created_at`,
+       RETURNING id, from_id AS "fromId", to_id AS "toId", content, is_read AS "read", created_at`,
       [fromId, toId, content.trim().slice(0, 5000)]
     );
     return res.json(result.rows[0]);
@@ -1446,10 +1446,14 @@ app.listen(PORT, async () => {
    from_id INTEGER NOT NULL,
    to_id INTEGER NOT NULL,
    content TEXT NOT NULL,
-   read BOOLEAN DEFAULT FALSE,
+   is_read BOOLEAN DEFAULT FALSE,
    created_at TIMESTAMPTZ DEFAULT NOW()
  );
  `);
+ // Migrate: rename 'read' column to 'is_read' if old schema exists
+ try {
+   await pool.query(`ALTER TABLE messages RENAME COLUMN "read" TO is_read`);
+ } catch (e) { /* column already renamed or doesn't exist */ }
 console.log("✅ DB ready");
 
     // Promote known coach accounts to admin
