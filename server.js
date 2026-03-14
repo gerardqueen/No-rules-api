@@ -1072,12 +1072,9 @@ let messagesTableReady = false;
 async function ensureMessagesTable() {
   if (messagesTableReady) return;
   try {
-    // Verify the table has the right columns by testing a simple query
     await pool.query(`SELECT from_id, to_id, content FROM messages LIMIT 0`);
-    messagesTableReady = true;
   } catch (e) {
-    // Table missing or wrong schema — drop and recreate
-    console.log("⚠️  Messages table missing or wrong schema, recreating...");
+    console.log("⚠️  Messages table missing, creating...");
     try { await pool.query(`DROP TABLE IF EXISTS messages`); } catch {}
     await pool.query(`
       CREATE TABLE messages (
@@ -1086,12 +1083,16 @@ async function ensureMessagesTable() {
         to_id INTEGER NOT NULL,
         content TEXT NOT NULL,
         is_read BOOLEAN DEFAULT FALSE,
+        message_type VARCHAR(20) DEFAULT 'chat',
+        checkin_id INTEGER,
         created_at TIMESTAMPTZ DEFAULT NOW()
       )
     `);
     console.log("✅ Messages table created");
-    messagesTableReady = true;
   }
+  try { await pool.query(`ALTER TABLE messages ADD COLUMN message_type VARCHAR(20) DEFAULT 'chat'`); } catch (_) {}
+  try { await pool.query(`ALTER TABLE messages ADD COLUMN checkin_id INTEGER`); } catch (_) {}
+  messagesTableReady = true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1115,7 +1116,7 @@ app.post("/messages/broadcast", requireAuth, requireCoach, async (req, res) => {
     let sent = 0;
     for (const a of athletes.rows) {
       await pool.query(
-        `INSERT INTO messages (from_id, to_id, content, created_at) VALUES ($1,$2,$3,NOW())`,
+        `INSERT INTO messages (from_id, to_id, content, message_type, created_at) VALUES ($1,$2,$3,'broadcast',NOW())`,
         [coachId, a.id, msg]
       );
       sent++;
@@ -1143,7 +1144,7 @@ app.post("/messages/broadcast-all", requireAuth, requireAdmin, async (req, res) 
     let sent = 0;
     for (const a of athletes.rows) {
       await pool.query(
-        `INSERT INTO messages (from_id, to_id, content, created_at) VALUES ($1,$2,$3,NOW())`,
+        `INSERT INTO messages (from_id, to_id, content, message_type, created_at) VALUES ($1,$2,$3,'broadcast',NOW())`,
         [adminId, a.id, msg]
       );
       sent++;
@@ -1152,6 +1153,46 @@ app.post("/messages/broadcast-all", requireAuth, requireAdmin, async (req, res) 
   } catch (err) {
     console.error("Broadcast-all error:", err);
     return res.status(500).json({ error: "Could not broadcast to all" });
+  }
+});
+
+// List conversations (distinct partners) with names — for separate coach/athlete threads
+app.get("/conversations", requireAuth, async (req, res) => {
+  try {
+    await ensureMessagesTable();
+    const me = req.user.id;
+    const result = await pool.query(`
+      SELECT DISTINCT u.id AS "otherId", u.name AS "otherName", u.role
+      FROM messages m
+      JOIN users u ON u.id = (CASE WHEN m.from_id = $1 THEN m.to_id ELSE m.from_id END)
+      WHERE m.from_id = $1 OR m.to_id = $1
+      ORDER BY "otherName"
+    `, [me]);
+    const out = [];
+    for (const row of result.rows) {
+      const last = await pool.query(
+        `SELECT content, created_at FROM messages
+         WHERE (from_id=$1 AND to_id=$2) OR (from_id=$2 AND to_id=$1)
+         ORDER BY created_at DESC LIMIT 1`,
+        [me, row.otherId]
+      );
+      const unread = await pool.query(
+        `SELECT COUNT(*)::int AS c FROM messages WHERE from_id=$1 AND to_id=$2 AND is_read=FALSE`,
+        [row.otherId, me]
+      );
+      out.push({
+        otherId: row.otherId,
+        otherName: row.otherName,
+        role: row.role,
+        lastMessage: last.rows[0]?.content?.slice(0, 80) || null,
+        lastAt: last.rows[0]?.created_at || null,
+        unreadCount: unread.rows[0]?.c || 0,
+      });
+    }
+    return res.json(out);
+  } catch (err) {
+    console.error("Conversations error:", err);
+    return res.status(500).json({ error: "Could not fetch conversations" });
   }
 });
 
@@ -1183,18 +1224,31 @@ app.get("/messages/:otherId", requireAuth, async (req, res) => {
     await ensureMessagesTable();
     const me = req.user.id;
     const other = Number(req.params.otherId);
-    // Don't select read column at all — avoids reserved word issues
-    const result = await pool.query(
-      `SELECT id, from_id AS "fromId", to_id AS "toId", content, created_at
-       FROM messages
-       WHERE (from_id=$1 AND to_id=$2) OR (from_id=$2 AND to_id=$1)
-       ORDER BY created_at ASC`,
-      [me, other]
-    );
-    // Mark messages TO me as read — try both column names
+    const typeFilter = req.query.type;
+    let sql = `
+      SELECT m.id, m.from_id AS "fromId", m.to_id AS "toId", m.content, m.created_at,
+             m.message_type AS "messageType", m.checkin_id AS "checkinId",
+             u.name AS "fromName"
+       FROM messages m
+       LEFT JOIN users u ON u.id = m.from_id
+       WHERE (m.from_id=$1 AND m.to_id=$2) OR (m.from_id=$2 AND m.to_id=$1)
+    `;
+    const params = [me, other];
+    if (typeFilter === "checkin") {
+      sql += ` AND m.message_type = 'checkin'`;
+    } else if (typeFilter === "chat") {
+      sql += ` AND (m.message_type IN ('chat','broadcast') OR m.message_type IS NULL)`;
+    }
+    sql += ` ORDER BY m.created_at ASC`;
+    const result = await pool.query(sql, params);
+    const rows = result.rows.map(r => ({
+      ...r,
+      fromName: r.fromName || "Unknown",
+      messageType: r.messageType || "chat",
+    }));
     try { await pool.query(`UPDATE messages SET is_read=TRUE WHERE from_id=$1 AND to_id=$2 AND is_read=FALSE`, [other, me]); }
     catch { try { await pool.query(`UPDATE messages SET "read"=TRUE WHERE from_id=$1 AND to_id=$2 AND "read"=FALSE`, [other, me]); } catch {} }
-    return res.json(result.rows);
+    return res.json(rows);
   } catch (err) {
     console.error("Get messages error:", err);
     return res.status(500).json({ error: "Could not fetch messages" });
@@ -1206,17 +1260,20 @@ app.post("/messages/:toId", requireAuth, async (req, res) => {
     await ensureMessagesTable();
     const fromId = req.user.id;
     const toId = Number(req.params.toId);
-    const { content } = req.body || {};
+    const { content, messageType, checkinId } = req.body || {};
     if (!content || typeof content !== "string" || !content.trim()) {
       return res.status(400).json({ error: "Message content is required" });
     }
+    const msgType = messageType === "checkin" ? "checkin" : "chat";
     const result = await pool.query(
-      `INSERT INTO messages (from_id, to_id, content, created_at)
-       VALUES ($1, $2, $3, NOW())
-       RETURNING id, from_id AS "fromId", to_id AS "toId", content, created_at`,
-      [fromId, toId, content.trim().slice(0, 5000)]
+      `INSERT INTO messages (from_id, to_id, content, message_type, checkin_id, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       RETURNING id, from_id AS "fromId", to_id AS "toId", content, message_type AS "messageType", checkin_id AS "checkinId", created_at`,
+      [fromId, toId, content.trim().slice(0, 5000), msgType, checkinId || null]
     );
-    return res.json(result.rows[0]);
+    const row = result.rows[0];
+    const fromUser = await pool.query("SELECT name FROM users WHERE id=$1", [fromId]);
+    return res.json({ ...row, fromName: fromUser.rows[0]?.name || "Unknown" });
   } catch (err) {
     console.error("Send message error:", err);
     return res.status(500).json({ error: "Could not send message" });
