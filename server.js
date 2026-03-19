@@ -1623,6 +1623,44 @@ app.get("/mfp-diary/:username", requireAuth, (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SHOPPING LIST — persistent per athlete
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/shopping-list/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const result = await pool.query(
+      `SELECT items FROM shopping_list WHERE athlete_id = $1`,
+      [athleteId]
+    );
+    return res.json({ items: result.rows[0]?.items || [] });
+  } catch (err) {
+    console.error("Get shopping list error:", err);
+    return res.status(500).json({ error: "Could not fetch shopping list" });
+  }
+});
+
+app.put("/shopping-list/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const items = req.body?.items;
+    if (!Array.isArray(items)) return res.status(400).json({ error: "items must be an array" });
+
+    await pool.query(
+      `INSERT INTO shopping_list (athlete_id, items, updated_at)
+       VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (athlete_id)
+       DO UPDATE SET items = EXCLUDED.items, updated_at = NOW()`,
+      [athleteId, JSON.stringify(items)]
+    );
+
+    return res.json({ ok: true, items });
+  } catch (err) {
+    console.error("Save shopping list error:", err);
+    return res.status(500).json({ error: "Could not save shopping list" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // OPEN FOOD FACTS — barcode lookup + text search (UK-prioritised, free, no key)
 // ─────────────────────────────────────────────────────────────────────────────
 const OFF_UA = "NoRulesNutrition/1.0 (contact@norules.com)";
@@ -1890,6 +1928,15 @@ app.listen(PORT, async () => {
  );
  `);
  // Messages table created on-demand via ensureMessagesTable() helper
+
+ await pool.query(`
+ CREATE TABLE IF NOT EXISTS shopping_list (
+   athlete_id INTEGER PRIMARY KEY,
+   items JSONB NOT NULL DEFAULT '[]'::jsonb,
+   updated_at TIMESTAMPTZ DEFAULT NOW()
+ );
+ `);
+
 console.log("✅ DB ready");
 
     // Promote known coach accounts to admin
