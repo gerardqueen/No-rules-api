@@ -1550,89 +1550,76 @@ app.get("/mfp-diary/:username", requireAuth, (req, res) => {
   })();
   if (!username) return res.status(400).json({ error: "Username required" });
 
-  const tryUrl = (url, attempt) => {
-    console.log(`MFP attempt ${attempt}: ${url}`);
-    const options = {
-      headers: {
-        "User-Agent": MFP_UA,
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-    };
+  const SCRAPER_KEY = process.env.SCRAPER_API_KEY || "";
+  if (!SCRAPER_KEY) {
+    console.warn("MFP: No SCRAPER_API_KEY set");
+    return res.status(502).json({ error: "Scraping proxy not configured", profileFound: false });
+  }
 
-    const request = https.get(url, options, (hr) => {
-      console.log(`MFP attempt ${attempt}: status=${hr.statusCode}`);
-      
-      // Follow redirects (up to 5)
-      if (hr.statusCode >= 300 && hr.statusCode < 400 && hr.headers.location && attempt < 5) {
-        const loc = hr.headers.location;
-        const next = loc.startsWith("http") ? loc : `https://www.myfitnesspal.com${loc.startsWith("/") ? "" : "/"}${loc}`;
-        hr.resume(); // drain the response
-        return tryUrl(next, attempt + 1);
-      }
+  const targetUrl = `https://www.myfitnesspal.com/food/diary/${username}?date=${dateStr}`;
+  const scraperUrl = `https://api.scraperapi.com?api_key=${SCRAPER_KEY}&url=${encodeURIComponent(targetUrl)}&render=false`;
 
-      if (hr.statusCode >= 400) {
-        hr.resume();
-        console.warn(`MFP: HTTP ${hr.statusCode}`);
-        return res.status(502).json({ error: `MFP returned ${hr.statusCode}`, profileFound: false });
-      }
+  console.log(`MFP: Fetching via ScraperAPI for ${username} (${dateStr})`);
 
-      let raw = "";
+  https.get(scraperUrl, (hr) => {
+    console.log(`MFP ScraperAPI: status=${hr.statusCode}`);
+
+    if (hr.statusCode >= 400) {
+      let errBody = "";
       hr.setEncoding("utf8");
-      hr.on("data", (chunk) => { raw += chunk; });
+      hr.on("data", (c) => { errBody += c; });
       hr.on("end", () => {
-        console.log(`MFP: Got ${raw.length} chars, diary=${raw.includes("diary")}, login=${raw.includes("Log In") && raw.includes("password")}`);
-        
-        // Check for login page (diary is private)
-        if (raw.includes("Log In") && raw.includes("password") && !raw.includes("total") && raw.length < 50000) {
-          return res.status(502).json({ error: "Diary is private (login page returned)", profileFound: false });
-        }
-
-        if (raw.length < 500) {
-          return res.status(502).json({ error: "Empty or too-short response from MFP", profileFound: false });
-        }
-
-        try {
-          const { cal, prot, carb, fat, fibre, meals } = parseMfpDiary(raw);
-          const profileFound = !raw.includes("This username is invalid") && !raw.includes("username is invalid") && !raw.includes("Page not found");
-          const hasData = profileFound && (cal > 0 || prot > 0 || carb > 0 || fat > 0);
-          console.log(`MFP ${username} (${dateStr}): found=${profileFound} cal=${cal} p=${prot} c=${carb} f=${fat}`);
-          return res.json({
-            profileFound, username, date: dateStr, source: "live",
-            calories: hasData ? Math.round(cal) : 0,
-            protein: hasData ? Math.round(prot) : 0,
-            carbs: hasData ? Math.round(carb) : 0,
-            fat: hasData ? Math.round(fat) : 0,
-            fibre: Math.round(fibre) || 0,
-            water: 0, exerciseCalories: 0, netCalories: hasData ? Math.round(cal) : 0,
-            meals: Array.isArray(meals) ? meals : [
-              { name: "Breakfast", calories: 0, logged: raw.toLowerCase().includes("breakfast") },
-              { name: "Lunch", calories: 0, logged: raw.toLowerCase().includes("lunch") },
-              { name: "Dinner", calories: 0, logged: raw.toLowerCase().includes("dinner") },
-              { name: "Snacks", calories: 0, logged: raw.toLowerCase().includes("snack") },
-            ],
-          });
-        } catch (e) {
-          console.error("MFP parse error:", e.message);
-          return res.status(500).json({ error: "Parse error", profileFound: false });
-        }
+        console.warn(`MFP ScraperAPI error: ${hr.statusCode} ${errBody.slice(0, 200)}`);
+        return res.status(502).json({ error: `ScraperAPI returned ${hr.statusCode}`, profileFound: false });
       });
-    });
+      return;
+    }
 
-    request.on("error", (e) => {
-      console.error(`MFP network error (attempt ${attempt}):`, e.message);
-      return res.status(502).json({ error: `Network error: ${e.message}`, profileFound: false });
-    });
+    let raw = "";
+    hr.setEncoding("utf8");
+    hr.on("data", (chunk) => { raw += chunk; });
+    hr.on("end", () => {
+      console.log(`MFP: Got ${raw.length} chars via ScraperAPI`);
 
-    request.setTimeout(15000, () => {
-      request.destroy();
-      console.warn("MFP: Request timed out");
-      return res.status(502).json({ error: "MFP request timed out", profileFound: false });
-    });
-  };
+      if (raw.length < 500) {
+        return res.status(502).json({ error: "Too-short response from MFP", profileFound: false });
+      }
 
-  const url = `https://www.myfitnesspal.com/food/diary/${username}?date=${dateStr}`;
-  tryUrl(url, 1);
+      // Check for login page (diary is private)
+      if (raw.includes("Log In") && raw.includes("password") && !raw.includes("total")) {
+        console.log("MFP: Diary is private (login page)");
+        return res.status(502).json({ error: "Diary is private — set it to public in MFP settings", profileFound: false });
+      }
+
+      try {
+        const { cal, prot, carb, fat, fibre, meals } = parseMfpDiary(raw);
+        const profileFound = !raw.includes("This username is invalid") && !raw.includes("username is invalid") && !raw.includes("Page not found");
+        const hasData = profileFound && (cal > 0 || prot > 0 || carb > 0 || fat > 0);
+        console.log(`MFP ${username} (${dateStr}): found=${profileFound} cal=${cal} p=${prot} c=${carb} f=${fat}`);
+        return res.json({
+          profileFound, username, date: dateStr, source: "live",
+          calories: hasData ? Math.round(cal) : 0,
+          protein: hasData ? Math.round(prot) : 0,
+          carbs: hasData ? Math.round(carb) : 0,
+          fat: hasData ? Math.round(fat) : 0,
+          fibre: Math.round(fibre) || 0,
+          water: 0, exerciseCalories: 0, netCalories: hasData ? Math.round(cal) : 0,
+          meals: Array.isArray(meals) ? meals : [
+            { name: "Breakfast", calories: 0, logged: raw.toLowerCase().includes("breakfast") },
+            { name: "Lunch", calories: 0, logged: raw.toLowerCase().includes("lunch") },
+            { name: "Dinner", calories: 0, logged: raw.toLowerCase().includes("dinner") },
+            { name: "Snacks", calories: 0, logged: raw.toLowerCase().includes("snack") },
+          ],
+        });
+      } catch (e) {
+        console.error("MFP parse error:", e.message);
+        return res.status(500).json({ error: "Parse error", profileFound: false });
+      }
+    });
+  }).on("error", (e) => {
+    console.error("MFP ScraperAPI network error:", e.message);
+    return res.status(502).json({ error: `Network error: ${e.message}`, profileFound: false });
+  });
 });
 
 app.get("/health", (req, res) => {
