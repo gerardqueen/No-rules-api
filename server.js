@@ -1542,25 +1542,6 @@ function extractMealsFromData(j) {
   return meals;
 }
 
-function fetchMfpWithRedirect(url, opts, cb) {
-  // Use built-in fetch (Node 18+) with redirect following
-  fetch(url, {
-    headers: opts.headers || {},
-    redirect: "follow",
-    signal: AbortSignal.timeout(10000),
-  })
-    .then(async (response) => {
-      if (!response.ok) {
-        cb(null, new Error(`HTTP ${response.status}`));
-        return;
-      }
-      const raw = await response.text();
-      // Simulate the old streaming interface
-      cb({ statusCode: response.status, raw });
-    })
-    .catch((e) => cb(null, e));
-}
-
 app.get("/mfp-diary/:username", requireAuth, async (req, res) => {
   const username = String(req.params.username || "").trim().toLowerCase();
   const dateStr = req.query.date || (() => {
@@ -1573,50 +1554,72 @@ app.get("/mfp-diary/:username", requireAuth, async (req, res) => {
     "User-Agent": MFP_UA,
     Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
   };
 
   // Try multiple URL patterns
   const urls = [
     `https://www.myfitnesspal.com/food/diary/${username}?date=${dateStr}`,
     `https://www.myfitnesspal.com/en/food/diary/${username}?date=${dateStr}`,
+    `https://www.myfitnesspal.com/food/diary/${username}`,
   ];
 
   let raw = null;
-  let fetchErr = null;
+  let lastStatus = 0;
+  let lastErr = null;
 
   for (const url of urls) {
     try {
+      console.log(`MFP: Trying ${url}`);
       const response = await fetch(url, {
         headers,
         redirect: "follow",
-        signal: AbortSignal.timeout(12000),
+        signal: AbortSignal.timeout(15000),
       });
-      if (response.ok) {
-        raw = await response.text();
-        if (raw && raw.length > 200) break;
+      lastStatus = response.status;
+      console.log(`MFP: ${url} → ${response.status} (${response.headers.get("content-type") || "unknown"})`);
+      
+      if (response.status === 200) {
+        const text = await response.text();
+        console.log(`MFP: Got ${text.length} chars, contains diary=${text.includes("diary")}, login=${text.includes("login")}, private=${text.includes("private")}`);
+        
+        // Skip login pages
+        if (text.includes("Log In") && text.includes("password") && !text.includes("diary-table") && !text.includes("total")) {
+          console.log("MFP: Got login page, diary is private");
+          lastErr = "Diary is private (login required)";
+          continue;
+        }
+        
+        if (text.length > 500) {
+          raw = text;
+          break;
+        }
+      } else {
+        const body = await response.text().catch(() => "");
+        console.log(`MFP: Non-200 response: ${response.status}, body preview: ${body.slice(0, 200)}`);
+        lastErr = `HTTP ${response.status}`;
       }
     } catch (e) {
-      fetchErr = e;
-      console.warn(`MFP fetch failed for ${url}:`, e.message);
+      console.warn(`MFP: Fetch error for ${url}:`, e.code || e.name, e.message);
+      lastErr = `${e.code || e.name}: ${e.message}`;
     }
   }
 
-  if (!raw || raw.length < 200) {
-    console.warn("MFP: No valid response from any URL pattern", fetchErr?.message);
+  if (!raw) {
+    console.warn(`MFP: All URLs failed. lastStatus=${lastStatus} lastErr=${lastErr}`);
     return res.status(502).json({
-      error: "MFP page unavailable — diary may be private or MFP is blocking requests",
+      error: lastErr || "MFP page unavailable",
       profileFound: false,
-      debug: fetchErr?.message || "Empty response",
+      debug: `status=${lastStatus} err=${lastErr}`,
     });
   }
 
   try {
     const { cal, prot, carb, fat, fibre, meals } = parseMfpDiary(raw);
-    const profileFound = !raw.includes("This username is invalid") && !raw.includes("username is invalid") && !raw.includes("not found") && !raw.includes("Page not found");
+    const profileFound = !raw.includes("This username is invalid") && !raw.includes("username is invalid") && !raw.includes("Page not found");
     const hasData = profileFound && (cal > 0 || prot > 0 || carb > 0 || fat > 0);
     
-    // Log what we found for debugging
-    console.log(`MFP ${username} (${dateStr}): profileFound=${profileFound} cal=${cal} prot=${prot} carb=${carb} fat=${fat} rawLen=${raw.length}`);
+    console.log(`MFP ${username} (${dateStr}): found=${profileFound} cal=${cal} p=${prot} c=${carb} f=${fat} rawLen=${raw.length}`);
     
     return res.json({
       profileFound,
