@@ -1557,7 +1557,7 @@ app.get("/mfp-diary/:username", requireAuth, (req, res) => {
   }
 
   const targetUrl = `https://www.myfitnesspal.com/food/diary/${username}?date=${dateStr}`;
-  const scraperUrl = `https://api.scraperapi.com?api_key=${SCRAPER_KEY}&url=${encodeURIComponent(targetUrl)}&render=false`;
+  const scraperUrl = `https://api.scraperapi.com?api_key=${SCRAPER_KEY}&url=${encodeURIComponent(targetUrl)}&render=true`;
 
   console.log(`MFP: Fetching via ScraperAPI for ${username} (${dateStr})`);
 
