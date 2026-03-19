@@ -1622,6 +1622,120 @@ app.get("/mfp-diary/:username", requireAuth, (req, res) => {
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// OPEN FOOD FACTS — barcode lookup + text search (UK-prioritised, free, no key)
+// ─────────────────────────────────────────────────────────────────────────────
+const OFF_UA = "NoRulesNutrition/1.0 (contact@norules.com)";
+
+// Helper: extract macros per 100g from an OFF product object
+function extractOFFProduct(product) {
+  if (!product || !product.product_name) return null;
+  const n = product.nutriments || {};
+  const cal = n["energy-kcal_100g"] ?? n["energy-kcal"] ?? (n["energy_100g"] ? Math.round(n["energy_100g"] / 4.184) : 0);
+  const prot = n.proteins_100g ?? n.proteins ?? 0;
+  const carbs = n.carbohydrates_100g ?? n.carbohydrates ?? 0;
+  const fat = n.fat_100g ?? n.fat ?? 0;
+  const fibre = n.fiber_100g ?? n.fibre_100g ?? 0;
+
+  // Build serving options from OFF data
+  const servings = [];
+  if (product.serving_quantity && product.serving_size) {
+    servings.push([product.serving_size, Math.round(Number(product.serving_quantity))]);
+  }
+  if (product.product_quantity) {
+    const qty = Number(product.product_quantity);
+    if (qty > 0 && qty < 2000) servings.push([`Full pack (${qty}g)`, qty]);
+  }
+
+  return {
+    name: product.product_name,
+    brand: product.brands || null,
+    barcode: product.code || null,
+    image: product.image_front_small_url || product.image_url || null,
+    calories: Math.round(Number(cal) || 0),
+    protein: Math.round((Number(prot) || 0) * 10) / 10,
+    carbs: Math.round((Number(carbs) || 0) * 10) / 10,
+    fat: Math.round((Number(fat) || 0) * 10) / 10,
+    fibre: Math.round((Number(fibre) || 0) * 10) / 10,
+    servings,  // [[label, grams], ...]
+    source: "openfoodfacts",
+  };
+}
+
+// GET /off/barcode/:code — lookup a single barcode
+app.get("/off/barcode/:code", requireAuth, (req, res) => {
+  const code = String(req.params.code || "").replace(/\D/g, "");
+  if (code.length < 8 || code.length > 14) {
+    return res.status(400).json({ error: "Barcode must be 8-14 digits" });
+  }
+
+  const url = `https://world.openfoodfacts.org/api/v2/product/${code}.json?fields=product_name,brands,nutriments,serving_quantity,serving_size,product_quantity,code,image_front_small_url,image_url`;
+
+  https.get(url, { headers: { "User-Agent": OFF_UA } }, (hr) => {
+    let raw = "";
+    hr.setEncoding("utf8");
+    hr.on("data", (c) => { raw += c; });
+    hr.on("end", () => {
+      try {
+        const j = JSON.parse(raw);
+        if (j.status !== 1 || !j.product) {
+          return res.json({ found: false, barcode: code });
+        }
+        const product = extractOFFProduct(j.product);
+        if (!product) return res.json({ found: false, barcode: code });
+        return res.json({ found: true, ...product });
+      } catch (e) {
+        console.error("OFF barcode parse error:", e.message);
+        return res.status(502).json({ error: "Failed to parse OFF response" });
+      }
+    });
+  }).on("error", (e) => {
+    console.error("OFF barcode network error:", e.message);
+    return res.status(502).json({ error: `OFF network error: ${e.message}` });
+  });
+});
+
+// GET /off/search?q=...&page=1 — text search (UK products prioritised)
+app.get("/off/search", requireAuth, (req, res) => {
+  const q = String(req.query.q || "").trim();
+  const page = Math.max(1, Math.min(10, Number(req.query.page || 1)));
+  if (q.length < 2) return res.status(400).json({ error: "Query too short" });
+
+  const params = new URLSearchParams({
+    search_terms: q,
+    json: "1",
+    page_size: "20",
+    page: String(page),
+    countries_tags_en: "united-kingdom",
+    sort_by: "unique_scans_n",
+    fields: "product_name,brands,nutriments,serving_quantity,serving_size,product_quantity,code,image_front_small_url,image_url",
+  });
+
+  const url = `https://world.openfoodfacts.org/cgi/search.pl?${params}`;
+
+  https.get(url, { headers: { "User-Agent": OFF_UA } }, (hr) => {
+    let raw = "";
+    hr.setEncoding("utf8");
+    hr.on("data", (c) => { raw += c; });
+    hr.on("end", () => {
+      try {
+        const j = JSON.parse(raw);
+        const products = (j.products || [])
+          .map(extractOFFProduct)
+          .filter(Boolean)
+          .filter(p => p.calories > 0 || p.protein > 0); // skip empty-data products
+        return res.json({ count: j.count || 0, products });
+      } catch (e) {
+        console.error("OFF search parse error:", e.message);
+        return res.status(502).json({ error: "Failed to parse OFF response" });
+      }
+    });
+  }).on("error", (e) => {
+    console.error("OFF search network error:", e.message);
+    return res.status(502).json({ error: `OFF network error: ${e.message}` });
+  });
+});
+
 app.get("/health", (req, res) => {
   return res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
