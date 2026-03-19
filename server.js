@@ -1543,17 +1543,25 @@ function extractMealsFromData(j) {
 }
 
 function fetchMfpWithRedirect(url, opts, cb) {
-  https.get(url, opts, (hr) => {
-    if (hr.statusCode >= 300 && hr.statusCode < 400 && hr.headers.location) {
-      const loc = hr.headers.location;
-      const next = loc.startsWith("http") ? loc : `https://www.myfitnesspal.com${loc.startsWith("/") ? "" : "/"}${loc}`;
-      return fetchMfpWithRedirect(next, opts, cb);
-    }
-    cb(hr);
-  }).on("error", (e) => cb(null, e));
+  // Use built-in fetch (Node 18+) with redirect following
+  fetch(url, {
+    headers: opts.headers || {},
+    redirect: "follow",
+    signal: AbortSignal.timeout(10000),
+  })
+    .then(async (response) => {
+      if (!response.ok) {
+        cb(null, new Error(`HTTP ${response.status}`));
+        return;
+      }
+      const raw = await response.text();
+      // Simulate the old streaming interface
+      cb({ statusCode: response.status, raw });
+    })
+    .catch((e) => cb(null, e));
 }
 
-app.get("/mfp-diary/:username", requireAuth, (req, res) => {
+app.get("/mfp-diary/:username", requireAuth, async (req, res) => {
   const username = String(req.params.username || "").trim().toLowerCase();
   const dateStr = req.query.date || (() => {
     const d = new Date();
@@ -1561,49 +1569,79 @@ app.get("/mfp-diary/:username", requireAuth, (req, res) => {
   })();
   if (!username) return res.status(400).json({ error: "Username required" });
 
-  // Try /en/ path first (common for MFP), then fallback to /food/diary/
-  const url = `https://www.myfitnesspal.com/food/diary/${username}?date=${dateStr}`;
-  const opts = { headers: { "User-Agent": MFP_UA, Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9" } };
+  const headers = {
+    "User-Agent": MFP_UA,
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+  };
 
-  fetchMfpWithRedirect(url, opts, (hr, err) => {
-    if (err || !hr) return res.status(502).json({ error: "MFP fetch failed", profileFound: false });
-    if (hr.statusCode >= 400) return res.status(502).json({ error: "MFP page unavailable", profileFound: false });
+  // Try multiple URL patterns
+  const urls = [
+    `https://www.myfitnesspal.com/food/diary/${username}?date=${dateStr}`,
+    `https://www.myfitnesspal.com/en/food/diary/${username}?date=${dateStr}`,
+  ];
 
-    let raw = "";
-    hr.setEncoding("utf8");
-    hr.on("data", (chunk) => { raw += chunk; });
-    hr.on("end", () => {
-      try {
-        const { cal, prot, carb, fat, fibre, meals } = parseMfpDiary(raw);
-        const profileFound = !raw.includes("This username is invalid") && !raw.includes("username is invalid") && !raw.includes("not found") && !raw.includes("Page not found");
-        const hasData = profileFound && (cal > 0 || prot > 0 || carb > 0 || fat > 0);
-        const result = {
-          profileFound,
-          username,
-          date: dateStr,
-          source: "live",
-          calories: hasData ? Math.round(cal) : 0,
-          protein: hasData ? Math.round(prot) : 0,
-          carbs: hasData ? Math.round(carb) : 0,
-          fat: hasData ? Math.round(fat) : 0,
-          fibre: Math.round(fibre) || 0,
-          water: 0,
-          exerciseCalories: 0,
-          netCalories: hasData ? Math.round(cal) : 0,
-          meals: Array.isArray(meals) ? meals : [
-            { name: "Breakfast", calories: 0, logged: raw.toLowerCase().includes("breakfast") },
-            { name: "Lunch", calories: 0, logged: raw.toLowerCase().includes("lunch") },
-            { name: "Dinner", calories: 0, logged: raw.toLowerCase().includes("dinner") },
-            { name: "Snacks", calories: 0, logged: raw.toLowerCase().includes("snack") },
-          ],
-          weekAdherence: [85, 90, 78, 95, 82, 88, 76],
-        };
-        res.json(result);
-      } catch (e) {
-        res.status(500).json({ error: "Parse error", profileFound: false });
+  let raw = null;
+  let fetchErr = null;
+
+  for (const url of urls) {
+    try {
+      const response = await fetch(url, {
+        headers,
+        redirect: "follow",
+        signal: AbortSignal.timeout(12000),
+      });
+      if (response.ok) {
+        raw = await response.text();
+        if (raw && raw.length > 200) break;
       }
+    } catch (e) {
+      fetchErr = e;
+      console.warn(`MFP fetch failed for ${url}:`, e.message);
+    }
+  }
+
+  if (!raw || raw.length < 200) {
+    console.warn("MFP: No valid response from any URL pattern", fetchErr?.message);
+    return res.status(502).json({
+      error: "MFP page unavailable — diary may be private or MFP is blocking requests",
+      profileFound: false,
+      debug: fetchErr?.message || "Empty response",
     });
-  });
+  }
+
+  try {
+    const { cal, prot, carb, fat, fibre, meals } = parseMfpDiary(raw);
+    const profileFound = !raw.includes("This username is invalid") && !raw.includes("username is invalid") && !raw.includes("not found") && !raw.includes("Page not found");
+    const hasData = profileFound && (cal > 0 || prot > 0 || carb > 0 || fat > 0);
+    
+    // Log what we found for debugging
+    console.log(`MFP ${username} (${dateStr}): profileFound=${profileFound} cal=${cal} prot=${prot} carb=${carb} fat=${fat} rawLen=${raw.length}`);
+    
+    return res.json({
+      profileFound,
+      username,
+      date: dateStr,
+      source: "live",
+      calories: hasData ? Math.round(cal) : 0,
+      protein: hasData ? Math.round(prot) : 0,
+      carbs: hasData ? Math.round(carb) : 0,
+      fat: hasData ? Math.round(fat) : 0,
+      fibre: Math.round(fibre) || 0,
+      water: 0,
+      exerciseCalories: 0,
+      netCalories: hasData ? Math.round(cal) : 0,
+      meals: Array.isArray(meals) ? meals : [
+        { name: "Breakfast", calories: 0, logged: raw.toLowerCase().includes("breakfast") },
+        { name: "Lunch", calories: 0, logged: raw.toLowerCase().includes("lunch") },
+        { name: "Dinner", calories: 0, logged: raw.toLowerCase().includes("dinner") },
+        { name: "Snacks", calories: 0, logged: raw.toLowerCase().includes("snack") },
+      ],
+    });
+  } catch (e) {
+    console.error("MFP parse error:", e.message);
+    return res.status(500).json({ error: "Parse error", profileFound: false });
+  }
 });
 
 app.get("/health", (req, res) => {
