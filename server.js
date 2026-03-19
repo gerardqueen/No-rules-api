@@ -1083,6 +1083,8 @@ async function ensureMessagesTable() {
         from_id INTEGER NOT NULL,
         to_id INTEGER NOT NULL,
         content TEXT NOT NULL,
+        subject TEXT,
+        thread_id TEXT,
         is_read BOOLEAN DEFAULT FALSE,
         message_type VARCHAR(20) DEFAULT 'chat',
         checkin_id INTEGER,
@@ -1093,6 +1095,8 @@ async function ensureMessagesTable() {
   }
   try { await pool.query(`ALTER TABLE messages ADD COLUMN message_type VARCHAR(20) DEFAULT 'chat'`); } catch (_) {}
   try { await pool.query(`ALTER TABLE messages ADD COLUMN checkin_id INTEGER`); } catch (_) {}
+  try { await pool.query(`ALTER TABLE messages ADD COLUMN subject TEXT`); } catch (_) {}
+  try { await pool.query(`ALTER TABLE messages ADD COLUMN thread_id TEXT`); } catch (_) {}
   messagesTableReady = true;
 }
 
@@ -1105,7 +1109,7 @@ app.post("/messages/broadcast", requireAuth, requireCoach, async (req, res) => {
   try {
     await ensureMessagesTable();
     const coachId = req.user.id;
-    const { content } = req.body || {};
+    const { content, subject } = req.body || {};
     if (!content || typeof content !== "string" || !content.trim()) {
       return res.status(400).json({ error: "Message content is required" });
     }
@@ -1114,11 +1118,13 @@ app.post("/messages/broadcast", requireAuth, requireCoach, async (req, res) => {
       [coachId]
     );
     const msg = content.trim().slice(0, 5000);
+    const subj = (subject || "Broadcast").slice(0, 200);
+    const threadId = `broadcast_${Date.now()}_${coachId}`;
     let sent = 0;
     for (const a of athletes.rows) {
       await pool.query(
-        `INSERT INTO messages (from_id, to_id, content, message_type, created_at) VALUES ($1,$2,$3,'broadcast',NOW())`,
-        [coachId, a.id, msg]
+        `INSERT INTO messages (from_id, to_id, content, subject, thread_id, message_type, created_at) VALUES ($1,$2,$3,$4,$5,'broadcast',NOW())`,
+        [coachId, a.id, msg, subj, threadId]
       );
       sent++;
     }
@@ -1134,7 +1140,7 @@ app.post("/messages/broadcast-all", requireAuth, requireAdmin, async (req, res) 
   try {
     await ensureMessagesTable();
     const adminId = req.user.id;
-    const { content } = req.body || {};
+    const { content, subject } = req.body || {};
     if (!content || typeof content !== "string" || !content.trim()) {
       return res.status(400).json({ error: "Message content is required" });
     }
@@ -1142,11 +1148,13 @@ app.post("/messages/broadcast-all", requireAuth, requireAdmin, async (req, res) 
       `SELECT id FROM users WHERE role NOT IN ('coach','admin')`
     );
     const msg = content.trim().slice(0, 5000);
+    const subj = (subject || "Announcement").slice(0, 200);
+    const threadId = `broadcast_all_${Date.now()}_${adminId}`;
     let sent = 0;
     for (const a of athletes.rows) {
       await pool.query(
-        `INSERT INTO messages (from_id, to_id, content, message_type, created_at) VALUES ($1,$2,$3,'broadcast',NOW())`,
-        [adminId, a.id, msg]
+        `INSERT INTO messages (from_id, to_id, content, subject, thread_id, message_type, created_at) VALUES ($1,$2,$3,$4,$5,'broadcast',NOW())`,
+        [adminId, a.id, msg, subj, threadId]
       );
       sent++;
     }
@@ -1220,6 +1228,70 @@ app.get("/messages-unread", requireAuth, async (req, res) => {
   }
 });
 
+// List message threads between current user and another user
+app.get("/messages/threads/:otherId", requireAuth, async (req, res) => {
+  try {
+    await ensureMessagesTable();
+    const me = req.user.id;
+    const other = Number(req.params.otherId);
+    const result = await pool.query(`
+      SELECT
+        COALESCE(m.thread_id, 'thread_' || m.id) AS "threadId",
+        MAX(m.subject) FILTER (WHERE m.subject IS NOT NULL) AS subject,
+        MAX(m.content) AS "lastMessage",
+        MAX(m.created_at) AS "lastAt",
+        MIN(m.created_at) AS "firstAt",
+        COUNT(*)::int AS "messageCount",
+        COUNT(*) FILTER (WHERE m.is_read = FALSE AND m.from_id = $2 AND m.to_id = $1)::int AS "unreadCount",
+        MAX(u.name) FILTER (WHERE u.id = (SELECT mm.from_id FROM messages mm WHERE COALESCE(mm.thread_id, 'thread_' || mm.id) = COALESCE(m.thread_id, 'thread_' || m.id) ORDER BY mm.created_at DESC LIMIT 1)) AS "lastSenderName"
+      FROM messages m
+      LEFT JOIN users u ON u.id = m.from_id
+      WHERE (m.from_id=$1 AND m.to_id=$2) OR (m.from_id=$2 AND m.to_id=$1)
+      GROUP BY COALESCE(m.thread_id, 'thread_' || m.id)
+      ORDER BY MAX(m.created_at) DESC
+    `, [me, other]);
+    return res.json(result.rows.map(r => ({
+      ...r,
+      subject: r.subject || "General",
+      lastMessage: (r.lastMessage || "").slice(0, 100),
+    })));
+  } catch (err) {
+    console.error("Threads error:", err);
+    return res.status(500).json({ error: "Could not fetch threads" });
+  }
+});
+
+// Get messages in a specific thread
+app.get("/messages/thread/:otherId/:threadId", requireAuth, async (req, res) => {
+  try {
+    await ensureMessagesTable();
+    const me = req.user.id;
+    const other = Number(req.params.otherId);
+    const threadId = req.params.threadId;
+    const result = await pool.query(`
+      SELECT m.id, m.from_id AS "fromId", m.to_id AS "toId", m.content, m.subject,
+             m.thread_id AS "threadId", m.created_at, m.message_type AS "messageType",
+             u.name AS "fromName"
+      FROM messages m
+      LEFT JOIN users u ON u.id = m.from_id
+      WHERE ((m.from_id=$1 AND m.to_id=$2) OR (m.from_id=$2 AND m.to_id=$1))
+        AND COALESCE(m.thread_id, 'thread_' || m.id) = $3
+      ORDER BY m.created_at ASC
+    `, [me, other, threadId]);
+    // Mark as read
+    try {
+      await pool.query(
+        `UPDATE messages SET is_read=TRUE WHERE from_id=$1 AND to_id=$2 AND is_read=FALSE AND COALESCE(thread_id, 'thread_' || id) = $3`,
+        [other, me, threadId]
+      );
+    } catch {}
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("Thread messages error:", err);
+    return res.status(500).json({ error: "Could not fetch thread messages" });
+  }
+});
+
 app.get("/messages/:otherId", requireAuth, async (req, res) => {
   try {
     await ensureMessagesTable();
@@ -1261,16 +1333,18 @@ app.post("/messages/:toId", requireAuth, async (req, res) => {
     await ensureMessagesTable();
     const fromId = req.user.id;
     const toId = Number(req.params.toId);
-    const { content, messageType, checkinId } = req.body || {};
+    const { content, messageType, checkinId, subject, threadId } = req.body || {};
     if (!content || typeof content !== "string" || !content.trim()) {
       return res.status(400).json({ error: "Message content is required" });
     }
     const msgType = messageType === "checkin" ? "checkin" : "chat";
+    // Generate thread_id if not provided (new thread)
+    const tid = threadId || `thread_${Date.now()}_${fromId}`;
     const result = await pool.query(
-      `INSERT INTO messages (from_id, to_id, content, message_type, checkin_id, created_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())
-       RETURNING id, from_id AS "fromId", to_id AS "toId", content, message_type AS "messageType", checkin_id AS "checkinId", created_at`,
-      [fromId, toId, content.trim().slice(0, 5000), msgType, checkinId || null]
+      `INSERT INTO messages (from_id, to_id, content, subject, thread_id, message_type, checkin_id, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       RETURNING id, from_id AS "fromId", to_id AS "toId", content, subject, thread_id AS "threadId", message_type AS "messageType", checkin_id AS "checkinId", created_at`,
+      [fromId, toId, content.trim().slice(0, 5000), subject || null, tid, msgType, checkinId || null]
     );
     const row = result.rows[0];
     const fromUser = await pool.query("SELECT name FROM users WHERE id=$1", [fromId]);
