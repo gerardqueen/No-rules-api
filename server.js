@@ -87,6 +87,15 @@ app.post("/auth/login", async (req, res) => {
       { expiresIn: "24h" }
     );
 
+    // Look up coach name if athlete has a coach
+    let coachName = null;
+    if (user.coach_id) {
+      try {
+        const coachRes = await pool.query("SELECT name FROM users WHERE id = $1", [user.coach_id]);
+        coachName = coachRes.rows[0]?.name || null;
+      } catch {}
+    }
+
     return res.json({
       token,
       user: {
@@ -97,6 +106,7 @@ app.post("/auth/login", async (req, res) => {
         sport: user.sport,
         mfpUsername: user.mfp_username,
         coachId: user.coach_id,
+        coachName,
         avatarUrl: user.avatar_url,
       },
     });
@@ -117,6 +127,14 @@ app.get("/auth/me", requireAuth, async (req, res) => {
     const user = result.rows[0];
     if (!user) return res.status(404).json({ error: "User not found" });
 
+    let coachName = null;
+    if (user.coach_id) {
+      try {
+        const coachRes = await pool.query("SELECT name FROM users WHERE id = $1", [user.coach_id]);
+        coachName = coachRes.rows[0]?.name || null;
+      } catch {}
+    }
+
     return res.json({
       id: user.id,
       email: user.email,
@@ -125,6 +143,7 @@ app.get("/auth/me", requireAuth, async (req, res) => {
       sport: user.sport,
       mfpUsername: user.mfp_username,
       coachId: user.coach_id,
+      coachName,
       avatarUrl: user.avatar_url,
     });
   } catch (err) {
