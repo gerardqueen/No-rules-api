@@ -1254,24 +1254,29 @@ app.get("/messages/threads/:otherId", requireAuth, async (req, res) => {
     const me = req.user.id;
     const other = Number(req.params.otherId);
     const result = await pool.query(`
+      WITH thread_groups AS (
+        SELECT COALESCE(m.thread_id, 'thread_' || m.id) AS tid,
+               m.id, m.content, m.subject, m.created_at, m.is_read, m.from_id, m.to_id,
+               ROW_NUMBER() OVER (PARTITION BY COALESCE(m.thread_id, 'thread_' || m.id) ORDER BY m.created_at DESC) AS rn,
+               ROW_NUMBER() OVER (PARTITION BY COALESCE(m.thread_id, 'thread_' || m.id) ORDER BY m.created_at ASC) AS rn_first
+        FROM messages m
+        WHERE (m.from_id=$1 AND m.to_id=$2) OR (m.from_id=$2 AND m.to_id=$1)
+      )
       SELECT
-        COALESCE(m.thread_id, 'thread_' || m.id) AS "threadId",
-        MAX(m.subject) FILTER (WHERE m.subject IS NOT NULL) AS subject,
-        MAX(m.content) AS "lastMessage",
-        MAX(m.created_at) AS "lastAt",
-        MIN(m.created_at) AS "firstAt",
+        t.tid AS "threadId",
+        MAX(CASE WHEN t.rn_first = 1 THEN t.subject END) AS subject,
+        MAX(CASE WHEN t.rn = 1 THEN t.content END) AS "lastMessage",
+        MAX(t.created_at) AS "lastAt",
+        MIN(t.created_at) AS "firstAt",
         COUNT(*)::int AS "messageCount",
-        COUNT(*) FILTER (WHERE m.is_read = FALSE AND m.from_id = $2 AND m.to_id = $1)::int AS "unreadCount",
-        MAX(u.name) FILTER (WHERE u.id = (SELECT mm.from_id FROM messages mm WHERE COALESCE(mm.thread_id, 'thread_' || mm.id) = COALESCE(m.thread_id, 'thread_' || m.id) ORDER BY mm.created_at DESC LIMIT 1)) AS "lastSenderName"
-      FROM messages m
-      LEFT JOIN users u ON u.id = m.from_id
-      WHERE (m.from_id=$1 AND m.to_id=$2) OR (m.from_id=$2 AND m.to_id=$1)
-      GROUP BY COALESCE(m.thread_id, 'thread_' || m.id)
-      ORDER BY MAX(m.created_at) DESC
+        COUNT(*) FILTER (WHERE t.is_read = FALSE AND t.from_id = $2 AND t.to_id = $1)::int AS "unreadCount"
+      FROM thread_groups t
+      GROUP BY t.tid
+      ORDER BY MAX(t.created_at) DESC
     `, [me, other]);
     return res.json(result.rows.map(r => ({
       ...r,
-      subject: r.subject || "General",
+      subject: r.subject || "No subject",
       lastMessage: (r.lastMessage || "").slice(0, 100),
     })));
   } catch (err) {
@@ -1716,6 +1721,58 @@ app.get("/mfp-diary/:username", requireAuth, (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// COACH VIDEOS — YouTube links posted by coaches, shown on athlete dashboard
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/coach-videos/:athleteId", requireAuth, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    // Get videos assigned to this athlete OR to all athletes (athlete_id IS NULL)
+    const result = await pool.query(
+      `SELECT v.*, u.name AS coach_name FROM coach_videos v
+       LEFT JOIN users u ON u.id = v.coach_id
+       WHERE v.athlete_id = $1 OR v.athlete_id IS NULL
+       ORDER BY v.created_at DESC`,
+      [athleteId]
+    );
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("Get coach videos error:", err);
+    return res.status(500).json({ error: "Could not fetch videos" });
+  }
+});
+
+app.post("/coach-videos", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { title, youtubeUrl, category, athleteId } = req.body || {};
+    if (!title || !youtubeUrl) return res.status(400).json({ error: "Title and YouTube URL required" });
+    // Extract YouTube video ID
+    const ytMatch = youtubeUrl.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([a-zA-Z0-9_-]{11})/);
+    const ytId = ytMatch ? ytMatch[1] : null;
+    if (!ytId) return res.status(400).json({ error: "Invalid YouTube URL" });
+
+    const result = await pool.query(
+      `INSERT INTO coach_videos (coach_id, athlete_id, title, youtube_url, youtube_id, category, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())
+       RETURNING *`,
+      [req.user.id, athleteId || null, title.trim(), youtubeUrl.trim(), ytId, (category || "General").trim()]
+    );
+    return res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Post coach video error:", err);
+    return res.status(500).json({ error: "Could not save video" });
+  }
+});
+
+app.delete("/coach-videos/:videoId", requireAuth, requireCoach, async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM coach_videos WHERE id = $1 AND coach_id = $2`, [Number(req.params.videoId), req.user.id]);
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ error: "Could not delete video" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SHOPPING LIST — persistent per athlete
 // ─────────────────────────────────────────────────────────────────────────────
 app.get("/shopping-list/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
@@ -2027,6 +2084,19 @@ app.listen(PORT, async () => {
    athlete_id INTEGER PRIMARY KEY,
    items JSONB NOT NULL DEFAULT '[]'::jsonb,
    updated_at TIMESTAMPTZ DEFAULT NOW()
+ );
+ `);
+
+ await pool.query(`
+ CREATE TABLE IF NOT EXISTS coach_videos (
+   id SERIAL PRIMARY KEY,
+   coach_id INTEGER NOT NULL,
+   athlete_id INTEGER,
+   title TEXT NOT NULL,
+   youtube_url TEXT NOT NULL,
+   youtube_id VARCHAR(20) NOT NULL,
+   category VARCHAR(50) DEFAULT 'General',
+   created_at TIMESTAMPTZ DEFAULT NOW()
  );
  `);
 
