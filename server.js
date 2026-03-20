@@ -108,6 +108,7 @@ app.post("/auth/login", async (req, res) => {
         coachId: user.coach_id,
         coachName,
         avatarUrl: user.avatar_url,
+        mustChangePassword: user.must_change_password || false,
       },
     });
   } catch (err) {
@@ -145,10 +146,43 @@ app.get("/auth/me", requireAuth, async (req, res) => {
       coachId: user.coach_id,
       coachName,
       avatarUrl: user.avatar_url,
+      mustChangePassword: user.must_change_password || false,
     });
   } catch (err) {
     console.error("Auth/me error:", err);
     return res.status(500).json({ error: "Something went wrong" });
+  }
+});
+
+// Change password (used after forced password change on first login)
+app.put("/auth/change-password", requireAuth, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body || {};
+    if (!newPassword || newPassword.length < 6) {
+      return res.status(400).json({ error: "New password must be at least 6 characters" });
+    }
+
+    const result = await pool.query("SELECT password_hash, must_change_password FROM users WHERE id = $1", [req.user.id]);
+    const user = result.rows[0];
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    // If must_change_password is set, we don't require the current password (they used a temp one)
+    if (!user.must_change_password) {
+      if (!currentPassword) return res.status(400).json({ error: "Current password is required" });
+      const ok = await bcrypt.compare(currentPassword, user.password_hash);
+      if (!ok) return res.status(401).json({ error: "Current password is incorrect" });
+    }
+
+    const newHash = await bcrypt.hash(newPassword, 12);
+    await pool.query(
+      "UPDATE users SET password_hash = $1, must_change_password = FALSE WHERE id = $2",
+      [newHash, req.user.id]
+    );
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Change password error:", err);
+    return res.status(500).json({ error: "Could not change password" });
   }
 });
 
@@ -320,6 +354,162 @@ app.post("/athletes", requireAuth, requireCoach, async (req, res) => {
   } catch (err) {
     console.error("Create athlete error:", err);
     return res.status(500).json({ error: "Could not create athlete" });
+  }
+});
+
+// ── Batch import athletes with welcome emails ──
+const crypto = require("crypto");
+
+function generateTempPassword() {
+  // 8-char readable password: consonant-vowel pattern + 2 digits
+  const c = "bcdfghjkmnpqrstvwxyz";
+  const v = "aeiou";
+  let pw = "";
+  for (let i = 0; i < 3; i++) pw += c[crypto.randomInt(c.length)] + v[crypto.randomInt(v.length)];
+  pw += crypto.randomInt(10).toString() + crypto.randomInt(10).toString();
+  return pw;
+}
+
+async function sendWelcomeEmail(toEmail, toName, tempPassword, coachName, loginUrl) {
+  const RESEND_KEY = process.env.RESEND_API_KEY;
+  if (!RESEND_KEY) {
+    console.warn("RESEND_API_KEY not set — skipping email for", toEmail);
+    return { sent: false, reason: "no_api_key" };
+  }
+
+  const fromEmail = process.env.RESEND_FROM_EMAIL || "onboarding@resend.dev";
+
+  const html = `
+    <div style="font-family: system-ui, sans-serif; max-width: 500px; margin: 0 auto; background: #0a0a0a; color: #fff; padding: 32px; border-radius: 16px;">
+      <div style="text-align: center; margin-bottom: 24px;">
+        <span style="font-size: 28px; font-weight: 800; letter-spacing: 2px;">
+          <span style="color: #FF9A52;">NO RULES</span> NUTRITION
+        </span>
+      </div>
+      <p style="font-size: 16px; line-height: 1.6;">Hey ${toName},</p>
+      <p style="font-size: 14px; line-height: 1.6; color: #ccc;">
+        Welcome to No Rules Nutrition! Your coach <strong style="color: #22c55e;">${coachName}</strong> has set up your account.
+      </p>
+      <div style="background: #1a1a1a; border: 1px solid #333; border-radius: 12px; padding: 20px; margin: 20px 0;">
+        <p style="margin: 0 0 8px; font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 1px;">Your login details</p>
+        <p style="margin: 4px 0; font-size: 14px;"><strong>Email:</strong> ${toEmail}</p>
+        <p style="margin: 4px 0; font-size: 14px;"><strong>Temporary password:</strong> <code style="background: #FF9A5222; color: #FF9A52; padding: 2px 8px; border-radius: 4px;">${tempPassword}</code></p>
+      </div>
+      <p style="font-size: 13px; color: #888; line-height: 1.5;">
+        You'll be asked to set your own password when you first log in.
+      </p>
+      <div style="text-align: center; margin: 24px 0;">
+        <a href="${loginUrl}" style="display: inline-block; background: #FF9A52; color: #0a0a0a; padding: 12px 28px; border-radius: 10px; text-decoration: none; font-weight: 700; font-size: 14px; letter-spacing: 1px;">LOG IN NOW</a>
+      </div>
+      <p style="font-size: 11px; color: #555; text-align: center;">
+        If you didn't expect this email, please ignore it.
+      </p>
+    </div>
+  `;
+
+  return new Promise((resolve) => {
+    const postData = JSON.stringify({
+      from: fromEmail,
+      to: [toEmail],
+      subject: `Welcome to No Rules Nutrition — Your login details`,
+      html,
+    });
+
+    const req = https.request({
+      hostname: "api.resend.com",
+      path: "/emails",
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${RESEND_KEY}`,
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(postData),
+      },
+    }, (res) => {
+      let raw = "";
+      res.on("data", c => { raw += c; });
+      res.on("end", () => {
+        try {
+          const j = JSON.parse(raw);
+          resolve({ sent: res.statusCode < 300, id: j.id, error: j.message });
+        } catch {
+          resolve({ sent: false, reason: "parse_error" });
+        }
+      });
+    });
+    req.on("error", (e) => resolve({ sent: false, reason: e.message }));
+    req.write(postData);
+    req.end();
+  });
+}
+
+app.post("/athletes/batch", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { athletes: list, sendEmails } = req.body || {};
+    if (!Array.isArray(list) || list.length === 0) {
+      return res.status(400).json({ error: "athletes array is required" });
+    }
+    if (list.length > 100) {
+      return res.status(400).json({ error: "Maximum 100 athletes per batch" });
+    }
+
+    const coachId = req.user.id;
+    const coachName = req.user.name || "Your Coach";
+    const loginUrl = process.env.APP_URL || "https://gerardqueen.github.io";
+
+    const results = [];
+    for (const a of list) {
+      const email = String(a.email || "").toLowerCase().trim();
+      const name = String(a.name || "").trim();
+      const sport = a.sport ? String(a.sport).trim() : null;
+
+      if (!email || !name) {
+        results.push({ email, name, status: "error", error: "Missing email or name" });
+        continue;
+      }
+
+      // Check for existing account
+      const existing = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
+      if (existing.rows[0]) {
+        results.push({ email, name, status: "exists", error: "Account already exists" });
+        continue;
+      }
+
+      // Generate temp password and create account
+      const tempPassword = generateTempPassword();
+      const passwordHash = await bcrypt.hash(tempPassword, 12);
+
+      try {
+        const created = await pool.query(
+          `INSERT INTO users (email, password_hash, name, role, sport, coach_id, must_change_password, created_at)
+           VALUES ($1, $2, $3, 'athlete', $4, $5, TRUE, NOW())
+           RETURNING id, email, name, sport`,
+          [email, passwordHash, name, sport, coachId]
+        );
+
+        const entry = { email, name, sport, status: "created", id: created.rows[0].id, tempPassword };
+
+        // Send welcome email if requested
+        if (sendEmails !== false) {
+          const emailResult = await sendWelcomeEmail(email, name, tempPassword, coachName, loginUrl);
+          entry.emailSent = emailResult.sent;
+          if (!emailResult.sent) entry.emailError = emailResult.reason || emailResult.error;
+        }
+
+        results.push(entry);
+      } catch (e) {
+        results.push({ email, name, status: "error", error: e.message });
+      }
+    }
+
+    const created = results.filter(r => r.status === "created").length;
+    const failed = results.filter(r => r.status === "error").length;
+    const exists = results.filter(r => r.status === "exists").length;
+    const emailed = results.filter(r => r.emailSent).length;
+
+    return res.json({ total: list.length, created, failed, exists, emailed, results });
+  } catch (err) {
+    console.error("Batch import error:", err);
+    return res.status(500).json({ error: "Batch import failed" });
   }
 });
 
@@ -1961,9 +2151,11 @@ app.listen(PORT, async () => {
         mfp_username TEXT,
         coach_id INTEGER,
         avatar_url TEXT,
+        must_change_password BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
+    try { await pool.query(`ALTER TABLE users ADD COLUMN must_change_password BOOLEAN DEFAULT FALSE`); } catch {};
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS macro_plans (
