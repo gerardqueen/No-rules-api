@@ -775,26 +775,27 @@ app.post("/moods/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (r
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// COACH CHECK-IN CALENDAR (links + notes by date)
+// COACH CHECK-IN NOTES (persist with athlete — survive coach reassignment)
+// ─────────────────────────────────────────────────────────────────────────────
 app.get("/checkins/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
-    const start = req.query.start ? String(req.query.start) : null;
-    const end = req.query.end ? String(req.query.end) : null;
-
-    let q = `SELECT id, date::text AS date, title, link_url AS \"linkUrl\", notes, created_at
-             FROM coach_checkins
-             WHERE athlete_id = $1`;
-    const params = [athleteId];
-    if (start) { params.push(start); q += ` AND date >= $${params.length}::date`; }
-    if (end) { params.push(end); q += ` AND date <= $${params.length}::date`; }
-    q += ` ORDER BY date ASC, id ASC`;
-
-    const result = await pool.query(q, params);
+    const result = await pool.query(
+      `SELECT c.id, c.date::text AS date, c.title, c.link_url AS "linkUrl", c.notes,
+              c.created_by AS "createdBy", c.updated_by AS "updatedBy",
+              c.created_at, c.updated_at,
+              u1.name AS "createdByName", u2.name AS "updatedByName"
+       FROM coach_checkins c
+       LEFT JOIN users u1 ON u1.id = c.created_by
+       LEFT JOIN users u2 ON u2.id = c.updated_by
+       WHERE c.athlete_id = $1
+       ORDER BY c.date DESC, c.id DESC`,
+      [athleteId]
+    );
     return res.json(result.rows);
   } catch (err) {
     console.error("Get checkins error:", err);
-    return res.status(500).json({ error: "Could not fetch check-ins" });
+    return res.status(500).json({ error: "Could not fetch check-in notes" });
   }
 });
 
@@ -803,25 +804,40 @@ app.post("/checkins/:athleteId", requireAuth, requireCoach, async (req, res) => 
     const athleteId = Number(req.params.athleteId);
     const ok = await coachOwnsAthlete(req.user.id, athleteId);
     if (!ok) return res.status(404).json({ error: "Athlete not found" });
-
-    const { date, title, linkUrl, notes } = req.body || {};
-    if (!date || typeof date !== "string") return res.status(400).json({ error: "date is required" });
-
-    const t = String(title || "Check-in").slice(0, 120);
-    const l = linkUrl ? String(linkUrl).slice(0, 500) : null;
-    const n = notes ? String(notes).slice(0, 2000) : null;
-
+    const { date, title, notes } = req.body || {};
+    if (!date) return res.status(400).json({ error: "date is required" });
     const result = await pool.query(
-      `INSERT INTO coach_checkins (athlete_id, date, title, link_url, notes, created_by, created_at)
-       VALUES ($1, $2::date, $3, $4, $5, $6, NOW())
-       RETURNING id, date::text AS date, title, link_url AS \"linkUrl\", notes, created_at`,
-      [athleteId, date, t, l, n, req.user.id]
+      `INSERT INTO coach_checkins (athlete_id, date, title, notes, created_by, created_at)
+       VALUES ($1, $2::date, $3, $4, $5, NOW())
+       RETURNING id, date::text AS date, title, notes, created_by AS "createdBy", created_at`,
+      [athleteId, date, String(title || "Check-in").slice(0, 200), String(notes || "").slice(0, 10000), req.user.id]
     );
-
     return res.json(result.rows[0]);
   } catch (err) {
     console.error("Create checkin error:", err);
-    return res.status(500).json({ error: "Could not create check-in" });
+    return res.status(500).json({ error: "Could not create check-in note" });
+  }
+});
+
+app.put("/checkins/:athleteId/:id", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const id = Number(req.params.id);
+    const ok = await coachOwnsAthlete(req.user.id, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+    const { title, notes } = req.body || {};
+    const result = await pool.query(
+      `UPDATE coach_checkins SET title = COALESCE($1, title), notes = COALESCE($2, notes),
+              updated_by = $3, updated_at = NOW()
+       WHERE id = $4 AND athlete_id = $5
+       RETURNING id, date::text AS date, title, notes, created_by AS "createdBy", updated_by AS "updatedBy", created_at, updated_at`,
+      [title ? String(title).slice(0, 200) : null, notes !== undefined ? String(notes).slice(0, 10000) : null, req.user.id, id, athleteId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Check-in not found" });
+    return res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Update checkin error:", err);
+    return res.status(500).json({ error: "Could not update check-in note" });
   }
 });
 
@@ -831,12 +847,11 @@ app.delete("/checkins/:athleteId/:id", requireAuth, requireCoach, async (req, re
     const id = Number(req.params.id);
     const ok = await coachOwnsAthlete(req.user.id, athleteId);
     if (!ok) return res.status(404).json({ error: "Athlete not found" });
-
     await pool.query('DELETE FROM coach_checkins WHERE id = $1 AND athlete_id = $2', [id, athleteId]);
     return res.json({ ok: true });
   } catch (err) {
     console.error("Delete checkin error:", err);
-    return res.status(500).json({ error: "Could not delete check-in" });
+    return res.status(500).json({ error: "Could not delete check-in note" });
   }
 });
 
@@ -2050,9 +2065,13 @@ app.listen(PORT, async () => {
         link_url TEXT,
         notes TEXT,
         created_by INTEGER,
-        created_at TIMESTAMPTZ DEFAULT NOW()
+        updated_by INTEGER,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ
       );
     `);
+    try { await pool.query(`ALTER TABLE coach_checkins ADD COLUMN updated_by INTEGER`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_checkins ADD COLUMN updated_at TIMESTAMPTZ`); } catch {}
 
  await pool.query(`
  CREATE TABLE IF NOT EXISTS food_logs (
