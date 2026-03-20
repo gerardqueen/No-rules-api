@@ -1128,6 +1128,7 @@ app.put("/food-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async
     const norm = foods.map((f) => ({
       id: f.id || null,
       name: String(f.name || "").slice(0, 120),
+      meal: String(f.meal || "Snack").slice(0, 24),
       grams: Number(f.grams || 0),
       calories: Number(f.calories || 0),
       protein_g: Number(f.protein_g ?? f.protein ?? 0),
