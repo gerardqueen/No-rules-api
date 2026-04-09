@@ -87,15 +87,6 @@ app.post("/auth/login", async (req, res) => {
       { expiresIn: "24h" }
     );
 
-    // Look up coach name if athlete has a coach
-    let coachName = null;
-    if (user.coach_id) {
-      try {
-        const coachRes = await pool.query("SELECT name FROM users WHERE id = $1", [user.coach_id]);
-        coachName = coachRes.rows[0]?.name || null;
-      } catch {}
-    }
-
     return res.json({
       token,
       user: {
@@ -106,9 +97,7 @@ app.post("/auth/login", async (req, res) => {
         sport: user.sport,
         mfpUsername: user.mfp_username,
         coachId: user.coach_id,
-        coachName,
         avatarUrl: user.avatar_url,
-        mustChangePassword: user.must_change_password || false,
       },
     });
   } catch (err) {
@@ -128,14 +117,6 @@ app.get("/auth/me", requireAuth, async (req, res) => {
     const user = result.rows[0];
     if (!user) return res.status(404).json({ error: "User not found" });
 
-    let coachName = null;
-    if (user.coach_id) {
-      try {
-        const coachRes = await pool.query("SELECT name FROM users WHERE id = $1", [user.coach_id]);
-        coachName = coachRes.rows[0]?.name || null;
-      } catch {}
-    }
-
     return res.json({
       id: user.id,
       email: user.email,
@@ -144,45 +125,11 @@ app.get("/auth/me", requireAuth, async (req, res) => {
       sport: user.sport,
       mfpUsername: user.mfp_username,
       coachId: user.coach_id,
-      coachName,
       avatarUrl: user.avatar_url,
-      mustChangePassword: user.must_change_password || false,
     });
   } catch (err) {
     console.error("Auth/me error:", err);
     return res.status(500).json({ error: "Something went wrong" });
-  }
-});
-
-// Change password (used after forced password change on first login)
-app.put("/auth/change-password", requireAuth, async (req, res) => {
-  try {
-    const { currentPassword, newPassword } = req.body || {};
-    if (!newPassword || newPassword.length < 6) {
-      return res.status(400).json({ error: "New password must be at least 6 characters" });
-    }
-
-    const result = await pool.query("SELECT password_hash, must_change_password FROM users WHERE id = $1", [req.user.id]);
-    const user = result.rows[0];
-    if (!user) return res.status(404).json({ error: "User not found" });
-
-    // If must_change_password is set, we don't require the current password (they used a temp one)
-    if (!user.must_change_password) {
-      if (!currentPassword) return res.status(400).json({ error: "Current password is required" });
-      const ok = await bcrypt.compare(currentPassword, user.password_hash);
-      if (!ok) return res.status(401).json({ error: "Current password is incorrect" });
-    }
-
-    const newHash = await bcrypt.hash(newPassword, 12);
-    await pool.query(
-      "UPDATE users SET password_hash = $1, must_change_password = FALSE WHERE id = $2",
-      [newHash, req.user.id]
-    );
-
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("Change password error:", err);
-    return res.status(500).json({ error: "Could not change password" });
   }
 });
 
@@ -354,162 +301,6 @@ app.post("/athletes", requireAuth, requireCoach, async (req, res) => {
   } catch (err) {
     console.error("Create athlete error:", err);
     return res.status(500).json({ error: "Could not create athlete" });
-  }
-});
-
-// ── Batch import athletes with welcome emails ──
-const crypto = require("crypto");
-
-function generateTempPassword() {
-  // 8-char readable password: consonant-vowel pattern + 2 digits
-  const c = "bcdfghjkmnpqrstvwxyz";
-  const v = "aeiou";
-  let pw = "";
-  for (let i = 0; i < 3; i++) pw += c[crypto.randomInt(c.length)] + v[crypto.randomInt(v.length)];
-  pw += crypto.randomInt(10).toString() + crypto.randomInt(10).toString();
-  return pw;
-}
-
-async function sendWelcomeEmail(toEmail, toName, tempPassword, coachName, loginUrl) {
-  const RESEND_KEY = process.env.RESEND_API_KEY;
-  if (!RESEND_KEY) {
-    console.warn("RESEND_API_KEY not set — skipping email for", toEmail);
-    return { sent: false, reason: "no_api_key" };
-  }
-
-  const fromEmail = process.env.RESEND_FROM_EMAIL || "onboarding@resend.dev";
-
-  const html = `
-    <div style="font-family: system-ui, sans-serif; max-width: 500px; margin: 0 auto; background: #0a0a0a; color: #fff; padding: 32px; border-radius: 16px;">
-      <div style="text-align: center; margin-bottom: 24px;">
-        <span style="font-size: 28px; font-weight: 800; letter-spacing: 2px;">
-          <span style="color: #FF9A52;">NO RULES</span> NUTRITION
-        </span>
-      </div>
-      <p style="font-size: 16px; line-height: 1.6;">Hey ${toName},</p>
-      <p style="font-size: 14px; line-height: 1.6; color: #ccc;">
-        Welcome to No Rules Nutrition! Your coach <strong style="color: #22c55e;">${coachName}</strong> has set up your account.
-      </p>
-      <div style="background: #1a1a1a; border: 1px solid #333; border-radius: 12px; padding: 20px; margin: 20px 0;">
-        <p style="margin: 0 0 8px; font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 1px;">Your login details</p>
-        <p style="margin: 4px 0; font-size: 14px;"><strong>Email:</strong> ${toEmail}</p>
-        <p style="margin: 4px 0; font-size: 14px;"><strong>Temporary password:</strong> <code style="background: #FF9A5222; color: #FF9A52; padding: 2px 8px; border-radius: 4px;">${tempPassword}</code></p>
-      </div>
-      <p style="font-size: 13px; color: #888; line-height: 1.5;">
-        You'll be asked to set your own password when you first log in.
-      </p>
-      <div style="text-align: center; margin: 24px 0;">
-        <a href="${loginUrl}" style="display: inline-block; background: #FF9A52; color: #0a0a0a; padding: 12px 28px; border-radius: 10px; text-decoration: none; font-weight: 700; font-size: 14px; letter-spacing: 1px;">LOG IN NOW</a>
-      </div>
-      <p style="font-size: 11px; color: #555; text-align: center;">
-        If you didn't expect this email, please ignore it.
-      </p>
-    </div>
-  `;
-
-  return new Promise((resolve) => {
-    const postData = JSON.stringify({
-      from: fromEmail,
-      to: [toEmail],
-      subject: `Welcome to No Rules Nutrition — Your login details`,
-      html,
-    });
-
-    const req = https.request({
-      hostname: "api.resend.com",
-      path: "/emails",
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${RESEND_KEY}`,
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(postData),
-      },
-    }, (res) => {
-      let raw = "";
-      res.on("data", c => { raw += c; });
-      res.on("end", () => {
-        try {
-          const j = JSON.parse(raw);
-          resolve({ sent: res.statusCode < 300, id: j.id, error: j.message });
-        } catch {
-          resolve({ sent: false, reason: "parse_error" });
-        }
-      });
-    });
-    req.on("error", (e) => resolve({ sent: false, reason: e.message }));
-    req.write(postData);
-    req.end();
-  });
-}
-
-app.post("/athletes/batch", requireAuth, requireCoach, async (req, res) => {
-  try {
-    const { athletes: list, sendEmails } = req.body || {};
-    if (!Array.isArray(list) || list.length === 0) {
-      return res.status(400).json({ error: "athletes array is required" });
-    }
-    if (list.length > 100) {
-      return res.status(400).json({ error: "Maximum 100 athletes per batch" });
-    }
-
-    const coachId = req.user.id;
-    const coachName = req.user.name || "Your Coach";
-    const loginUrl = process.env.APP_URL || "https://gerardqueen.github.io";
-
-    const results = [];
-    for (const a of list) {
-      const email = String(a.email || "").toLowerCase().trim();
-      const name = String(a.name || "").trim();
-      const sport = a.sport ? String(a.sport).trim() : null;
-
-      if (!email || !name) {
-        results.push({ email, name, status: "error", error: "Missing email or name" });
-        continue;
-      }
-
-      // Check for existing account
-      const existing = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
-      if (existing.rows[0]) {
-        results.push({ email, name, status: "exists", error: "Account already exists" });
-        continue;
-      }
-
-      // Generate temp password and create account
-      const tempPassword = generateTempPassword();
-      const passwordHash = await bcrypt.hash(tempPassword, 12);
-
-      try {
-        const created = await pool.query(
-          `INSERT INTO users (email, password_hash, name, role, sport, coach_id, must_change_password, created_at)
-           VALUES ($1, $2, $3, 'athlete', $4, $5, TRUE, NOW())
-           RETURNING id, email, name, sport`,
-          [email, passwordHash, name, sport, coachId]
-        );
-
-        const entry = { email, name, sport, status: "created", id: created.rows[0].id, tempPassword };
-
-        // Send welcome email if requested
-        if (sendEmails !== false) {
-          const emailResult = await sendWelcomeEmail(email, name, tempPassword, coachName, loginUrl);
-          entry.emailSent = emailResult.sent;
-          if (!emailResult.sent) entry.emailError = emailResult.reason || emailResult.error;
-        }
-
-        results.push(entry);
-      } catch (e) {
-        results.push({ email, name, status: "error", error: e.message });
-      }
-    }
-
-    const created = results.filter(r => r.status === "created").length;
-    const failed = results.filter(r => r.status === "error").length;
-    const exists = results.filter(r => r.status === "exists").length;
-    const emailed = results.filter(r => r.emailSent).length;
-
-    return res.json({ total: list.length, created, failed, exists, emailed, results });
-  } catch (err) {
-    console.error("Batch import error:", err);
-    return res.status(500).json({ error: "Batch import failed" });
   }
 });
 
@@ -965,27 +756,26 @@ app.post("/moods/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (r
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// COACH CHECK-IN NOTES (persist with athlete — survive coach reassignment)
-// ─────────────────────────────────────────────────────────────────────────────
+// COACH CHECK-IN CALENDAR (links + notes by date)
 app.get("/checkins/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
-    const result = await pool.query(
-      `SELECT c.id, c.date::text AS date, c.title, c.link_url AS "linkUrl", c.notes,
-              c.created_by AS "createdBy", c.updated_by AS "updatedBy",
-              c.created_at, c.updated_at,
-              u1.name AS "createdByName", u2.name AS "updatedByName"
-       FROM coach_checkins c
-       LEFT JOIN users u1 ON u1.id = c.created_by
-       LEFT JOIN users u2 ON u2.id = c.updated_by
-       WHERE c.athlete_id = $1
-       ORDER BY c.date DESC, c.id DESC`,
-      [athleteId]
-    );
+    const start = req.query.start ? String(req.query.start) : null;
+    const end = req.query.end ? String(req.query.end) : null;
+
+    let q = `SELECT id, date::text AS date, title, link_url AS \"linkUrl\", notes, created_at
+             FROM coach_checkins
+             WHERE athlete_id = $1`;
+    const params = [athleteId];
+    if (start) { params.push(start); q += ` AND date >= $${params.length}::date`; }
+    if (end) { params.push(end); q += ` AND date <= $${params.length}::date`; }
+    q += ` ORDER BY date ASC, id ASC`;
+
+    const result = await pool.query(q, params);
     return res.json(result.rows);
   } catch (err) {
     console.error("Get checkins error:", err);
-    return res.status(500).json({ error: "Could not fetch check-in notes" });
+    return res.status(500).json({ error: "Could not fetch check-ins" });
   }
 });
 
@@ -994,40 +784,25 @@ app.post("/checkins/:athleteId", requireAuth, requireCoach, async (req, res) => 
     const athleteId = Number(req.params.athleteId);
     const ok = await coachOwnsAthlete(req.user.id, athleteId);
     if (!ok) return res.status(404).json({ error: "Athlete not found" });
-    const { date, title, notes } = req.body || {};
-    if (!date) return res.status(400).json({ error: "date is required" });
+
+    const { date, title, linkUrl, notes } = req.body || {};
+    if (!date || typeof date !== "string") return res.status(400).json({ error: "date is required" });
+
+    const t = String(title || "Check-in").slice(0, 120);
+    const l = linkUrl ? String(linkUrl).slice(0, 500) : null;
+    const n = notes ? String(notes).slice(0, 2000) : null;
+
     const result = await pool.query(
-      `INSERT INTO coach_checkins (athlete_id, date, title, notes, created_by, created_at)
-       VALUES ($1, $2::date, $3, $4, $5, NOW())
-       RETURNING id, date::text AS date, title, notes, created_by AS "createdBy", created_at`,
-      [athleteId, date, String(title || "Check-in").slice(0, 200), String(notes || "").slice(0, 10000), req.user.id]
+      `INSERT INTO coach_checkins (athlete_id, date, title, link_url, notes, created_by, created_at)
+       VALUES ($1, $2::date, $3, $4, $5, $6, NOW())
+       RETURNING id, date::text AS date, title, link_url AS \"linkUrl\", notes, created_at`,
+      [athleteId, date, t, l, n, req.user.id]
     );
+
     return res.json(result.rows[0]);
   } catch (err) {
     console.error("Create checkin error:", err);
-    return res.status(500).json({ error: "Could not create check-in note" });
-  }
-});
-
-app.put("/checkins/:athleteId/:id", requireAuth, requireCoach, async (req, res) => {
-  try {
-    const athleteId = Number(req.params.athleteId);
-    const id = Number(req.params.id);
-    const ok = await coachOwnsAthlete(req.user.id, athleteId);
-    if (!ok) return res.status(404).json({ error: "Athlete not found" });
-    const { title, notes } = req.body || {};
-    const result = await pool.query(
-      `UPDATE coach_checkins SET title = COALESCE($1, title), notes = COALESCE($2, notes),
-              updated_by = $3, updated_at = NOW()
-       WHERE id = $4 AND athlete_id = $5
-       RETURNING id, date::text AS date, title, notes, created_by AS "createdBy", updated_by AS "updatedBy", created_at, updated_at`,
-      [title ? String(title).slice(0, 200) : null, notes !== undefined ? String(notes).slice(0, 10000) : null, req.user.id, id, athleteId]
-    );
-    if (result.rows.length === 0) return res.status(404).json({ error: "Check-in not found" });
-    return res.json(result.rows[0]);
-  } catch (err) {
-    console.error("Update checkin error:", err);
-    return res.status(500).json({ error: "Could not update check-in note" });
+    return res.status(500).json({ error: "Could not create check-in" });
   }
 });
 
@@ -1037,11 +812,12 @@ app.delete("/checkins/:athleteId/:id", requireAuth, requireCoach, async (req, re
     const id = Number(req.params.id);
     const ok = await coachOwnsAthlete(req.user.id, athleteId);
     if (!ok) return res.status(404).json({ error: "Athlete not found" });
+
     await pool.query('DELETE FROM coach_checkins WHERE id = $1 AND athlete_id = $2', [id, athleteId]);
     return res.json({ ok: true });
   } catch (err) {
     console.error("Delete checkin error:", err);
-    return res.status(500).json({ error: "Could not delete check-in note" });
+    return res.status(500).json({ error: "Could not delete check-in" });
   }
 });
 
@@ -1128,7 +904,6 @@ app.put("/food-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async
     const norm = foods.map((f) => ({
       id: f.id || null,
       name: String(f.name || "").slice(0, 120),
-      meal: String(f.meal || "Snack").slice(0, 24),
       grams: Number(f.grams || 0),
       calories: Number(f.calories || 0),
       protein_g: Number(f.protein_g ?? f.protein ?? 0),
@@ -1308,8 +1083,6 @@ async function ensureMessagesTable() {
         from_id INTEGER NOT NULL,
         to_id INTEGER NOT NULL,
         content TEXT NOT NULL,
-        subject TEXT,
-        thread_id TEXT,
         is_read BOOLEAN DEFAULT FALSE,
         message_type VARCHAR(20) DEFAULT 'chat',
         checkin_id INTEGER,
@@ -1320,8 +1093,6 @@ async function ensureMessagesTable() {
   }
   try { await pool.query(`ALTER TABLE messages ADD COLUMN message_type VARCHAR(20) DEFAULT 'chat'`); } catch (_) {}
   try { await pool.query(`ALTER TABLE messages ADD COLUMN checkin_id INTEGER`); } catch (_) {}
-  try { await pool.query(`ALTER TABLE messages ADD COLUMN subject TEXT`); } catch (_) {}
-  try { await pool.query(`ALTER TABLE messages ADD COLUMN thread_id TEXT`); } catch (_) {}
   messagesTableReady = true;
 }
 
@@ -1334,7 +1105,7 @@ app.post("/messages/broadcast", requireAuth, requireCoach, async (req, res) => {
   try {
     await ensureMessagesTable();
     const coachId = req.user.id;
-    const { content, subject } = req.body || {};
+    const { content } = req.body || {};
     if (!content || typeof content !== "string" || !content.trim()) {
       return res.status(400).json({ error: "Message content is required" });
     }
@@ -1343,13 +1114,11 @@ app.post("/messages/broadcast", requireAuth, requireCoach, async (req, res) => {
       [coachId]
     );
     const msg = content.trim().slice(0, 5000);
-    const subj = (subject || "Broadcast").slice(0, 200);
-    const threadId = `broadcast_${Date.now()}_${coachId}`;
     let sent = 0;
     for (const a of athletes.rows) {
       await pool.query(
-        `INSERT INTO messages (from_id, to_id, content, subject, thread_id, message_type, created_at) VALUES ($1,$2,$3,$4,$5,'broadcast',NOW())`,
-        [coachId, a.id, msg, subj, threadId]
+        `INSERT INTO messages (from_id, to_id, content, message_type, created_at) VALUES ($1,$2,$3,'broadcast',NOW())`,
+        [coachId, a.id, msg]
       );
       sent++;
     }
@@ -1365,7 +1134,7 @@ app.post("/messages/broadcast-all", requireAuth, requireAdmin, async (req, res) 
   try {
     await ensureMessagesTable();
     const adminId = req.user.id;
-    const { content, subject } = req.body || {};
+    const { content } = req.body || {};
     if (!content || typeof content !== "string" || !content.trim()) {
       return res.status(400).json({ error: "Message content is required" });
     }
@@ -1373,13 +1142,11 @@ app.post("/messages/broadcast-all", requireAuth, requireAdmin, async (req, res) 
       `SELECT id FROM users WHERE role NOT IN ('coach','admin')`
     );
     const msg = content.trim().slice(0, 5000);
-    const subj = (subject || "Announcement").slice(0, 200);
-    const threadId = `broadcast_all_${Date.now()}_${adminId}`;
     let sent = 0;
     for (const a of athletes.rows) {
       await pool.query(
-        `INSERT INTO messages (from_id, to_id, content, subject, thread_id, message_type, created_at) VALUES ($1,$2,$3,$4,$5,'broadcast',NOW())`,
-        [adminId, a.id, msg, subj, threadId]
+        `INSERT INTO messages (from_id, to_id, content, message_type, created_at) VALUES ($1,$2,$3,'broadcast',NOW())`,
+        [adminId, a.id, msg]
       );
       sent++;
     }
@@ -1453,75 +1220,6 @@ app.get("/messages-unread", requireAuth, async (req, res) => {
   }
 });
 
-// List message threads between current user and another user
-app.get("/messages/threads/:otherId", requireAuth, async (req, res) => {
-  try {
-    await ensureMessagesTable();
-    const me = req.user.id;
-    const other = Number(req.params.otherId);
-    const result = await pool.query(`
-      WITH thread_groups AS (
-        SELECT COALESCE(m.thread_id, 'thread_' || m.id) AS tid,
-               m.id, m.content, m.subject, m.created_at, m.is_read, m.from_id, m.to_id,
-               ROW_NUMBER() OVER (PARTITION BY COALESCE(m.thread_id, 'thread_' || m.id) ORDER BY m.created_at DESC) AS rn,
-               ROW_NUMBER() OVER (PARTITION BY COALESCE(m.thread_id, 'thread_' || m.id) ORDER BY m.created_at ASC) AS rn_first
-        FROM messages m
-        WHERE (m.from_id=$1 AND m.to_id=$2) OR (m.from_id=$2 AND m.to_id=$1)
-      )
-      SELECT
-        t.tid AS "threadId",
-        MAX(CASE WHEN t.rn_first = 1 THEN t.subject END) AS subject,
-        MAX(CASE WHEN t.rn = 1 THEN t.content END) AS "lastMessage",
-        MAX(t.created_at) AS "lastAt",
-        MIN(t.created_at) AS "firstAt",
-        COUNT(*)::int AS "messageCount",
-        COUNT(*) FILTER (WHERE t.is_read = FALSE AND t.from_id = $2 AND t.to_id = $1)::int AS "unreadCount"
-      FROM thread_groups t
-      GROUP BY t.tid
-      ORDER BY MAX(t.created_at) DESC
-    `, [me, other]);
-    return res.json(result.rows.map(r => ({
-      ...r,
-      subject: r.subject || "No subject",
-      lastMessage: (r.lastMessage || "").slice(0, 100),
-    })));
-  } catch (err) {
-    console.error("Threads error:", err);
-    return res.status(500).json({ error: "Could not fetch threads" });
-  }
-});
-
-// Get messages in a specific thread
-app.get("/messages/thread/:otherId/:threadId", requireAuth, async (req, res) => {
-  try {
-    await ensureMessagesTable();
-    const me = req.user.id;
-    const other = Number(req.params.otherId);
-    const threadId = req.params.threadId;
-    const result = await pool.query(`
-      SELECT m.id, m.from_id AS "fromId", m.to_id AS "toId", m.content, m.subject,
-             m.thread_id AS "threadId", m.created_at, m.message_type AS "messageType",
-             u.name AS "fromName"
-      FROM messages m
-      LEFT JOIN users u ON u.id = m.from_id
-      WHERE ((m.from_id=$1 AND m.to_id=$2) OR (m.from_id=$2 AND m.to_id=$1))
-        AND COALESCE(m.thread_id, 'thread_' || m.id) = $3
-      ORDER BY m.created_at ASC
-    `, [me, other, threadId]);
-    // Mark as read
-    try {
-      await pool.query(
-        `UPDATE messages SET is_read=TRUE WHERE from_id=$1 AND to_id=$2 AND is_read=FALSE AND COALESCE(thread_id, 'thread_' || id) = $3`,
-        [other, me, threadId]
-      );
-    } catch {}
-    return res.json(result.rows);
-  } catch (err) {
-    console.error("Thread messages error:", err);
-    return res.status(500).json({ error: "Could not fetch thread messages" });
-  }
-});
-
 app.get("/messages/:otherId", requireAuth, async (req, res) => {
   try {
     await ensureMessagesTable();
@@ -1563,18 +1261,16 @@ app.post("/messages/:toId", requireAuth, async (req, res) => {
     await ensureMessagesTable();
     const fromId = req.user.id;
     const toId = Number(req.params.toId);
-    const { content, messageType, checkinId, subject, threadId } = req.body || {};
+    const { content, messageType, checkinId } = req.body || {};
     if (!content || typeof content !== "string" || !content.trim()) {
       return res.status(400).json({ error: "Message content is required" });
     }
     const msgType = messageType === "checkin" ? "checkin" : "chat";
-    // Generate thread_id if not provided (new thread)
-    const tid = threadId || `thread_${Date.now()}_${fromId}`;
     const result = await pool.query(
-      `INSERT INTO messages (from_id, to_id, content, subject, thread_id, message_type, checkin_id, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-       RETURNING id, from_id AS "fromId", to_id AS "toId", content, subject, thread_id AS "threadId", message_type AS "messageType", checkin_id AS "checkinId", created_at`,
-      [fromId, toId, content.trim().slice(0, 5000), subject || null, tid, msgType, checkinId || null]
+      `INSERT INTO messages (from_id, to_id, content, message_type, checkin_id, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       RETURNING id, from_id AS "fromId", to_id AS "toId", content, message_type AS "messageType", checkin_id AS "checkinId", created_at`,
+      [fromId, toId, content.trim().slice(0, 5000), msgType, checkinId || null]
     );
     const row = result.rows[0];
     const fromUser = await pool.query("SELECT name FROM users WHERE id=$1", [fromId]);
@@ -1861,7 +1557,7 @@ app.get("/mfp-diary/:username", requireAuth, (req, res) => {
   }
 
   const targetUrl = `https://www.myfitnesspal.com/food/diary/${username}?date=${dateStr}`;
-  const scraperUrl = `https://api.scraperapi.com?api_key=${SCRAPER_KEY}&url=${encodeURIComponent(targetUrl)}&render=true`;
+  const scraperUrl = `https://api.scraperapi.com?api_key=${SCRAPER_KEY}&url=${encodeURIComponent(targetUrl)}&render=false`;
 
   console.log(`MFP: Fetching via ScraperAPI for ${username} (${dateStr})`);
 
@@ -1927,207 +1623,177 @@ app.get("/mfp-diary/:username", requireAuth, (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// COACH VIDEOS — YouTube links posted by coaches, shown on athlete dashboard
+// SHARED FOOD DATABASE — barcode lookup + user-contributed foods
 // ─────────────────────────────────────────────────────────────────────────────
-app.get("/coach-videos/:athleteId", requireAuth, async (req, res) => {
+
+// Lookup food by barcode (shared across all athletes)
+app.get("/foods/barcode/:code", requireAuth, async (req, res) => {
   try {
-    const athleteId = Number(req.params.athleteId);
-    // Get videos assigned to this athlete OR to all athletes (athlete_id IS NULL)
-    const result = await pool.query(
-      `SELECT v.*, u.name AS coach_name FROM coach_videos v
-       LEFT JOIN users u ON u.id = v.coach_id
-       WHERE v.athlete_id = $1 OR v.athlete_id IS NULL
-       ORDER BY v.created_at DESC`,
-      [athleteId]
+    const barcode = String(req.params.code || "").trim();
+    if (!barcode) return res.status(400).json({ error: "Barcode required" });
+    const r = await pool.query(
+      `SELECT id, barcode, name, brand, calories, protein_g, carbs_g, fat_g, fibre_g,
+              serving_size, serving_unit, created_by, report_count, created_at
+       FROM custom_foods WHERE barcode = $1 LIMIT 1`,
+      [barcode]
     );
-    return res.json(result.rows);
+    if (!r.rows[0]) return res.status(404).json({ error: "Not found", barcode });
+    return res.json(r.rows[0]);
   } catch (err) {
-    console.error("Get coach videos error:", err);
-    return res.status(500).json({ error: "Could not fetch videos" });
+    console.error("Food barcode lookup error:", err);
+    return res.status(500).json({ error: "Could not lookup food" });
   }
 });
 
-app.post("/coach-videos", requireAuth, requireCoach, async (req, res) => {
+// Text search for food autocomplete
+app.get("/foods/search", requireAuth, async (req, res) => {
   try {
-    const { title, youtubeUrl, category, athleteId } = req.body || {};
-    if (!title || !youtubeUrl) return res.status(400).json({ error: "Title and YouTube URL required" });
-    // Extract YouTube video ID
-    const ytMatch = youtubeUrl.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([a-zA-Z0-9_-]{11})/);
-    const ytId = ytMatch ? ytMatch[1] : null;
-    if (!ytId) return res.status(400).json({ error: "Invalid YouTube URL" });
-
-    const result = await pool.query(
-      `INSERT INTO coach_videos (coach_id, athlete_id, title, youtube_url, youtube_id, category, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW())
-       RETURNING *`,
-      [req.user.id, athleteId || null, title.trim(), youtubeUrl.trim(), ytId, (category || "General").trim()]
+    const q = String(req.query.q || "").trim();
+    if (q.length < 2) return res.json([]);
+    const r = await pool.query(
+      `SELECT id, barcode, name, brand, calories, protein_g, carbs_g, fat_g, fibre_g,
+              serving_size, serving_unit, report_count
+       FROM custom_foods
+       WHERE LOWER(name) LIKE $1 OR LOWER(COALESCE(brand,'')) LIKE $1
+       ORDER BY report_count ASC, name ASC
+       LIMIT 25`,
+      [`%${q.toLowerCase()}%`]
     );
-    return res.json(result.rows[0]);
+    return res.json(r.rows);
   } catch (err) {
-    console.error("Post coach video error:", err);
-    return res.status(500).json({ error: "Could not save video" });
+    console.error("Food search error:", err);
+    return res.status(500).json({ error: "Could not search foods" });
   }
 });
 
-app.delete("/coach-videos/:videoId", requireAuth, requireCoach, async (req, res) => {
+// Add a new food to the shared database
+app.post("/foods", requireAuth, async (req, res) => {
   try {
-    await pool.query(`DELETE FROM coach_videos WHERE id = $1 AND coach_id = $2`, [Number(req.params.videoId), req.user.id]);
+    const { barcode, name, brand, calories, protein_g, carbs_g, fat_g, fibre_g, serving_size, serving_unit } = req.body || {};
+    if (!name || typeof name !== "string") return res.status(400).json({ error: "Name is required" });
+    const cals = Number(calories);
+    if (!Number.isFinite(cals) || cals < 0) return res.status(400).json({ error: "Invalid calories" });
+
+    // If barcode provided, check for duplicate first
+    if (barcode) {
+      const existing = await pool.query(`SELECT id FROM custom_foods WHERE barcode = $1`, [String(barcode).trim()]);
+      if (existing.rows[0]) return res.status(409).json({ error: "Barcode already exists", id: existing.rows[0].id });
+    }
+
+    const r = await pool.query(
+      `INSERT INTO custom_foods (barcode, name, brand, calories, protein_g, carbs_g, fat_g, fibre_g, serving_size, serving_unit, created_by, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+       RETURNING id, barcode, name, brand, calories, protein_g, carbs_g, fat_g, fibre_g, serving_size, serving_unit, created_by, report_count`,
+      [
+        barcode ? String(barcode).trim() : null,
+        String(name).slice(0, 200),
+        brand ? String(brand).slice(0, 120) : null,
+        Math.round(cals),
+        Math.round(Number(protein_g) || 0),
+        Math.round(Number(carbs_g) || 0),
+        Math.round(Number(fat_g) || 0),
+        Math.round(Number(fibre_g) || 0),
+        Number(serving_size) || 100,
+        String(serving_unit || "g").slice(0, 12),
+        req.user.id,
+      ]
+    );
+    return res.status(201).json(r.rows[0]);
+  } catch (err) {
+    console.error("Create food error:", err);
+    return res.status(500).json({ error: "Could not create food" });
+  }
+});
+
+// Report a food as incorrect (increments report_count)
+app.post("/foods/:id/report", requireAuth, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: "Invalid food id" });
+    const { reason } = req.body || {};
+    await pool.query(`UPDATE custom_foods SET report_count = COALESCE(report_count, 0) + 1 WHERE id = $1`, [id]);
+    try {
+      await pool.query(
+        `INSERT INTO food_reports (food_id, reported_by, reason, created_at) VALUES ($1, $2, $3, NOW())`,
+        [id, req.user.id, reason ? String(reason).slice(0, 500) : null]
+      );
+    } catch {}
     return res.json({ ok: true });
   } catch (err) {
-    return res.status(500).json({ error: "Could not delete video" });
+    console.error("Report food error:", err);
+    return res.status(500).json({ error: "Could not report food" });
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SHOPPING LIST — persistent per athlete
+// CUSTOM MEALS — private per athlete (MFP-style quick-add)
 // ─────────────────────────────────────────────────────────────────────────────
-app.get("/shopping-list/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+app.get("/meals/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
-    const result = await pool.query(
-      `SELECT items FROM shopping_list WHERE athlete_id = $1`,
-      [athleteId]
-    );
-    return res.json({ items: result.rows[0]?.items || [] });
+    const q = String(req.query.q || "").trim().toLowerCase();
+    let sql = `SELECT id, name, ingredients, total_calories, total_protein_g, total_carbs_g, total_fat_g, total_fibre_g, created_at
+               FROM custom_meals WHERE athlete_id = $1`;
+    const params = [athleteId];
+    if (q.length >= 1) {
+      params.push(`%${q}%`);
+      sql += ` AND LOWER(name) LIKE $${params.length}`;
+    }
+    sql += ` ORDER BY name ASC LIMIT 50`;
+    const r = await pool.query(sql, params);
+    return res.json(r.rows.map(row => ({ ...row, ingredients: row.ingredients || [] })));
   } catch (err) {
-    console.error("Get shopping list error:", err);
-    return res.status(500).json({ error: "Could not fetch shopping list" });
+    console.error("Get meals error:", err);
+    return res.status(500).json({ error: "Could not fetch meals" });
   }
 });
 
-app.put("/shopping-list/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+app.post("/meals/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
-    const items = req.body?.items;
-    if (!Array.isArray(items)) return res.status(400).json({ error: "items must be an array" });
+    const { name, ingredients } = req.body || {};
+    if (!name || typeof name !== "string") return res.status(400).json({ error: "Meal name is required" });
+    if (!Array.isArray(ingredients) || ingredients.length === 0) return res.status(400).json({ error: "Ingredients required" });
 
-    await pool.query(
-      `INSERT INTO shopping_list (athlete_id, items, updated_at)
-       VALUES ($1, $2::jsonb, NOW())
-       ON CONFLICT (athlete_id)
-       DO UPDATE SET items = EXCLUDED.items, updated_at = NOW()`,
-      [athleteId, JSON.stringify(items)]
+    // Normalize and compute totals
+    const norm = ingredients.map(i => ({
+      id: i.id || null,
+      name: String(i.name || "").slice(0, 120),
+      grams: Number(i.grams || 0),
+      calories: Number(i.calories || 0),
+      protein_g: Number(i.protein_g ?? i.protein ?? 0),
+      carbs_g: Number(i.carbs_g ?? i.carbs ?? 0),
+      fat_g: Number(i.fat_g ?? i.fat ?? 0),
+      fibre_g: Number(i.fibre_g ?? i.fibre ?? 0),
+    }));
+    const totals = norm.reduce((a, i) => ({
+      cal: a.cal + i.calories, p: a.p + i.protein_g, c: a.c + i.carbs_g, f: a.f + i.fat_g, fi: a.fi + i.fibre_g,
+    }), { cal: 0, p: 0, c: 0, f: 0, fi: 0 });
+
+    const r = await pool.query(
+      `INSERT INTO custom_meals (athlete_id, name, ingredients, total_calories, total_protein_g, total_carbs_g, total_fat_g, total_fibre_g, created_at)
+       VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, NOW())
+       RETURNING id, name, ingredients, total_calories, total_protein_g, total_carbs_g, total_fat_g, total_fibre_g, created_at`,
+      [athleteId, String(name).slice(0, 120), JSON.stringify(norm), Math.round(totals.cal), Math.round(totals.p), Math.round(totals.c), Math.round(totals.f), Math.round(totals.fi)]
     );
-
-    return res.json({ ok: true, items });
+    const row = r.rows[0];
+    return res.status(201).json({ ...row, ingredients: row.ingredients || [] });
   } catch (err) {
-    console.error("Save shopping list error:", err);
-    return res.status(500).json({ error: "Could not save shopping list" });
+    console.error("Create meal error:", err);
+    return res.status(500).json({ error: "Could not create meal" });
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// OPEN FOOD FACTS — barcode lookup + text search (UK-prioritised, free, no key)
-// ─────────────────────────────────────────────────────────────────────────────
-const OFF_UA = "NoRulesNutrition/1.0 (contact@norules.com)";
-
-// Helper: extract macros per 100g from an OFF product object
-function extractOFFProduct(product) {
-  if (!product || !product.product_name) return null;
-  const n = product.nutriments || {};
-  const cal = n["energy-kcal_100g"] ?? n["energy-kcal"] ?? (n["energy_100g"] ? Math.round(n["energy_100g"] / 4.184) : 0);
-  const prot = n.proteins_100g ?? n.proteins ?? 0;
-  const carbs = n.carbohydrates_100g ?? n.carbohydrates ?? 0;
-  const fat = n.fat_100g ?? n.fat ?? 0;
-  const fibre = n.fiber_100g ?? n.fibre_100g ?? 0;
-
-  // Build serving options from OFF data
-  const servings = [];
-  if (product.serving_quantity && product.serving_size) {
-    servings.push([product.serving_size, Math.round(Number(product.serving_quantity))]);
+app.delete("/meals/:athleteId/:id", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const id = Number(req.params.id);
+    await pool.query(`DELETE FROM custom_meals WHERE id = $1 AND athlete_id = $2`, [id, athleteId]);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Delete meal error:", err);
+    return res.status(500).json({ error: "Could not delete meal" });
   }
-  if (product.product_quantity) {
-    const qty = Number(product.product_quantity);
-    if (qty > 0 && qty < 2000) servings.push([`Full pack (${qty}g)`, qty]);
-  }
-
-  return {
-    name: product.product_name,
-    brand: product.brands || null,
-    barcode: product.code || null,
-    image: product.image_front_small_url || product.image_url || null,
-    calories: Math.round(Number(cal) || 0),
-    protein: Math.round((Number(prot) || 0) * 10) / 10,
-    carbs: Math.round((Number(carbs) || 0) * 10) / 10,
-    fat: Math.round((Number(fat) || 0) * 10) / 10,
-    fibre: Math.round((Number(fibre) || 0) * 10) / 10,
-    servings,  // [[label, grams], ...]
-    source: "openfoodfacts",
-  };
-}
-
-// GET /off/barcode/:code — lookup a single barcode
-app.get("/off/barcode/:code", requireAuth, (req, res) => {
-  const code = String(req.params.code || "").replace(/\D/g, "");
-  if (code.length < 8 || code.length > 14) {
-    return res.status(400).json({ error: "Barcode must be 8-14 digits" });
-  }
-
-  const url = `https://world.openfoodfacts.org/api/v2/product/${code}.json?fields=product_name,brands,nutriments,serving_quantity,serving_size,product_quantity,code,image_front_small_url,image_url`;
-
-  https.get(url, { headers: { "User-Agent": OFF_UA } }, (hr) => {
-    let raw = "";
-    hr.setEncoding("utf8");
-    hr.on("data", (c) => { raw += c; });
-    hr.on("end", () => {
-      try {
-        const j = JSON.parse(raw);
-        if (j.status !== 1 || !j.product) {
-          return res.json({ found: false, barcode: code });
-        }
-        const product = extractOFFProduct(j.product);
-        if (!product) return res.json({ found: false, barcode: code });
-        return res.json({ found: true, ...product });
-      } catch (e) {
-        console.error("OFF barcode parse error:", e.message);
-        return res.status(502).json({ error: "Failed to parse OFF response" });
-      }
-    });
-  }).on("error", (e) => {
-    console.error("OFF barcode network error:", e.message);
-    return res.status(502).json({ error: `OFF network error: ${e.message}` });
-  });
-});
-
-// GET /off/search?q=...&page=1 — text search (UK products prioritised)
-app.get("/off/search", requireAuth, (req, res) => {
-  const q = String(req.query.q || "").trim();
-  const page = Math.max(1, Math.min(10, Number(req.query.page || 1)));
-  if (q.length < 2) return res.status(400).json({ error: "Query too short" });
-
-  const params = new URLSearchParams({
-    search_terms: q,
-    json: "1",
-    page_size: "20",
-    page: String(page),
-    countries_tags_en: "united-kingdom",
-    sort_by: "unique_scans_n",
-    fields: "product_name,brands,nutriments,serving_quantity,serving_size,product_quantity,code,image_front_small_url,image_url",
-  });
-
-  const url = `https://world.openfoodfacts.org/cgi/search.pl?${params}`;
-
-  https.get(url, { headers: { "User-Agent": OFF_UA } }, (hr) => {
-    let raw = "";
-    hr.setEncoding("utf8");
-    hr.on("data", (c) => { raw += c; });
-    hr.on("end", () => {
-      try {
-        const j = JSON.parse(raw);
-        const products = (j.products || [])
-          .map(extractOFFProduct)
-          .filter(Boolean)
-          .filter(p => p.calories > 0 || p.protein > 0); // skip empty-data products
-        return res.json({ count: j.count || 0, products });
-      } catch (e) {
-        console.error("OFF search parse error:", e.message);
-        return res.status(502).json({ error: "Failed to parse OFF response" });
-      }
-    });
-  }).on("error", (e) => {
-    console.error("OFF search network error:", e.message);
-    return res.status(502).json({ error: `OFF network error: ${e.message}` });
-  });
 });
 
 app.get("/health", (req, res) => {
@@ -2152,11 +1818,9 @@ app.listen(PORT, async () => {
         mfp_username TEXT,
         coach_id INTEGER,
         avatar_url TEXT,
-        must_change_password BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
-    try { await pool.query(`ALTER TABLE users ADD COLUMN must_change_password BOOLEAN DEFAULT FALSE`); } catch {};
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS macro_plans (
@@ -2258,13 +1922,9 @@ app.listen(PORT, async () => {
         link_url TEXT,
         notes TEXT,
         created_by INTEGER,
-        updated_by INTEGER,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ
+        created_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
-    try { await pool.query(`ALTER TABLE coach_checkins ADD COLUMN updated_by INTEGER`); } catch {}
-    try { await pool.query(`ALTER TABLE coach_checkins ADD COLUMN updated_at TIMESTAMPTZ`); } catch {}
 
  await pool.query(`
  CREATE TABLE IF NOT EXISTS food_logs (
@@ -2291,26 +1951,51 @@ app.listen(PORT, async () => {
  `);
  // Messages table created on-demand via ensureMessagesTable() helper
 
- await pool.query(`
- CREATE TABLE IF NOT EXISTS shopping_list (
-   athlete_id INTEGER PRIMARY KEY,
-   items JSONB NOT NULL DEFAULT '[]'::jsonb,
-   updated_at TIMESTAMPTZ DEFAULT NOW()
- );
- `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS custom_foods (
+        id BIGSERIAL PRIMARY KEY,
+        barcode TEXT UNIQUE,
+        name TEXT NOT NULL,
+        brand TEXT,
+        calories INTEGER NOT NULL DEFAULT 0,
+        protein_g INTEGER NOT NULL DEFAULT 0,
+        carbs_g INTEGER NOT NULL DEFAULT 0,
+        fat_g INTEGER NOT NULL DEFAULT 0,
+        fibre_g INTEGER NOT NULL DEFAULT 0,
+        serving_size NUMERIC(8,2) DEFAULT 100,
+        serving_unit TEXT DEFAULT 'g',
+        created_by INTEGER,
+        report_count INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_custom_foods_name ON custom_foods (LOWER(name))`); } catch {}
 
- await pool.query(`
- CREATE TABLE IF NOT EXISTS coach_videos (
-   id SERIAL PRIMARY KEY,
-   coach_id INTEGER NOT NULL,
-   athlete_id INTEGER,
-   title TEXT NOT NULL,
-   youtube_url TEXT NOT NULL,
-   youtube_id VARCHAR(20) NOT NULL,
-   category VARCHAR(50) DEFAULT 'General',
-   created_at TIMESTAMPTZ DEFAULT NOW()
- );
- `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS food_reports (
+        id BIGSERIAL PRIMARY KEY,
+        food_id BIGINT NOT NULL,
+        reported_by INTEGER,
+        reason TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS custom_meals (
+        id BIGSERIAL PRIMARY KEY,
+        athlete_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        ingredients JSONB NOT NULL DEFAULT '[]'::jsonb,
+        total_calories INTEGER DEFAULT 0,
+        total_protein_g INTEGER DEFAULT 0,
+        total_carbs_g INTEGER DEFAULT 0,
+        total_fat_g INTEGER DEFAULT 0,
+        total_fibre_g INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_custom_meals_athlete ON custom_meals (athlete_id, LOWER(name))`); } catch {}
 
 console.log("✅ DB ready");
 
