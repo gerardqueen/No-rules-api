@@ -1239,47 +1239,63 @@ app.get("/messages/threads/:otherId", requireAuth, async (req, res) => {
     const other = Number(req.params.otherId);
     if (!Number.isInteger(other)) return res.status(400).json({ error: "Invalid user id" });
 
-    const result = await pool.query(`
-      WITH pair_msgs AS (
-        SELECT m.id, m.from_id, m.to_id, m.content, m.subject,
-               m.is_read, m.created_at,
-               COALESCE(m.thread_id, -m.id) AS effective_thread_id
-        FROM messages m
-        WHERE (m.from_id = $1 AND m.to_id = $2)
-           OR (m.from_id = $2 AND m.to_id = $1)
-      ),
-      last_per_thread AS (
-        SELECT DISTINCT ON (effective_thread_id)
-               effective_thread_id,
-               content AS last_content,
-               created_at AS last_at
-        FROM pair_msgs
-        ORDER BY effective_thread_id, created_at DESC
-      ),
-      summary AS (
-        SELECT effective_thread_id,
-               COALESCE(MAX(subject), 'Conversation') AS subject,
-               SUM(CASE WHEN is_read = FALSE AND to_id = $1 THEN 1 ELSE 0 END)::int AS unread_count,
-               COUNT(*)::int AS message_count
-        FROM pair_msgs
-        GROUP BY effective_thread_id
-      )
-      SELECT s.effective_thread_id AS "threadId",
-             s.subject,
-             l.last_at AS "lastAt",
-             l.last_content AS "lastMessage",
-             s.unread_count AS "unreadCount",
-             s.message_count AS "messageCount"
-      FROM summary s
-      JOIN last_per_thread l USING (effective_thread_id)
-      ORDER BY l.last_at DESC
-      LIMIT 100
-    `, [me, other]);
+    // Discover which optional columns exist (so we don't blow up on older schemas)
+    const cols = await pool.query(
+      `SELECT column_name FROM information_schema.columns WHERE table_name = 'messages'`
+    );
+    const colSet = new Set(cols.rows.map(r => r.column_name));
+    const hasSubject = colSet.has("subject");
+    const hasThreadId = colSet.has("thread_id");
+    const hasIsRead = colSet.has("is_read");
 
-    return res.json(result.rows.map(r => ({ ...r, otherId: other })));
+    // Pull all messages between me and the other user, then group in JS
+    const selectCols = [
+      "id", "from_id", "to_id", "content", "created_at",
+      hasSubject ? "subject" : "NULL::text AS subject",
+      hasThreadId ? "thread_id" : "NULL::bigint AS thread_id",
+      hasIsRead ? "is_read" : "TRUE AS is_read",
+    ].join(", ");
+
+    const result = await pool.query(
+      `SELECT ${selectCols}
+       FROM messages
+       WHERE (from_id = $1 AND to_id = $2)
+          OR (from_id = $2 AND to_id = $1)
+       ORDER BY created_at ASC`,
+      [me, other]
+    );
+
+    // Group by effective thread id
+    const groups = new Map();
+    for (const m of result.rows) {
+      const tid = m.thread_id ? Number(m.thread_id) : -Number(m.id);
+      let g = groups.get(tid);
+      if (!g) {
+        g = {
+          threadId: tid,
+          subject: m.subject || "Conversation",
+          lastAt: m.created_at,
+          lastMessage: m.content,
+          unreadCount: 0,
+          messageCount: 0,
+          otherId: other,
+        };
+        groups.set(tid, g);
+      }
+      g.messageCount += 1;
+      if (new Date(m.created_at) >= new Date(g.lastAt)) {
+        g.lastAt = m.created_at;
+        g.lastMessage = m.content;
+      }
+      if (m.subject && (!g.subject || g.subject === "Conversation")) g.subject = m.subject;
+      if (m.is_read === false && Number(m.to_id) === me) g.unreadCount += 1;
+    }
+
+    const out = Array.from(groups.values()).sort((a, b) => new Date(b.lastAt) - new Date(a.lastAt));
+    return res.json(out);
   } catch (err) {
     console.error("Threads list error:", err);
-    return res.status(500).json({ error: "Could not fetch threads" });
+    return res.status(500).json({ error: "Could not fetch threads", detail: err.message });
   }
 });
 
@@ -2317,6 +2333,50 @@ app.listen(PORT, async () => {
       );
     `);
     try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_custom_meals_athlete ON custom_meals (athlete_id, LOWER(name))`); } catch {}
+
+    // ── Force-run schema upgrades that may be missing on older databases ──
+    // Messages: ensure thread_id and subject columns exist
+    try { await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS thread_id BIGINT`); } catch (e) { console.warn("messages.thread_id:", e.message); }
+    try { await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS subject TEXT`); } catch (e) { console.warn("messages.subject:", e.message); }
+    try { await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS message_type VARCHAR(20) DEFAULT 'chat'`); } catch {}
+    try { await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS checkin_id INTEGER`); } catch {}
+
+    // Coach videos: ensure full schema (older DB may have a different structure)
+    try {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS coach_videos (
+          id BIGSERIAL PRIMARY KEY,
+          athlete_id INTEGER NOT NULL,
+          title TEXT,
+          youtube_id TEXT,
+          category TEXT DEFAULT 'General',
+          notes TEXT,
+          created_by INTEGER,
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+      `);
+    } catch (e) { console.warn("coach_videos create:", e.message); }
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS title TEXT`); } catch (e) { console.warn("coach_videos.title:", e.message); }
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS youtube_id TEXT`); } catch (e) { console.warn("coach_videos.youtube_id:", e.message); }
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'General'`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS notes TEXT`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS created_by INTEGER`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS athlete_id INTEGER`); } catch {}
+    // Drop any leftover NOT NULL constraints from old schemas (so our new INSERTs work)
+    try { await pool.query(`ALTER TABLE coach_videos ALTER COLUMN title DROP NOT NULL`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_videos ALTER COLUMN youtube_id DROP NOT NULL`); } catch {}
+    // Discover any extra NOT NULL columns from older schemas and relax them
+    try {
+      const cv = await pool.query(
+        `SELECT column_name FROM information_schema.columns
+         WHERE table_name = 'coach_videos' AND is_nullable = 'NO' AND column_default IS NULL AND column_name != 'id'`
+      );
+      for (const row of cv.rows) {
+        try { await pool.query(`ALTER TABLE coach_videos ALTER COLUMN ${row.column_name} DROP NOT NULL`); } catch (e) { console.warn(`coach_videos.${row.column_name} drop not null:`, e.message); }
+      }
+    } catch (e) { console.warn("coach_videos NOT NULL scan:", e.message); }
+    try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_coach_videos_athlete ON coach_videos (athlete_id, created_at DESC)`); } catch {}
 
 console.log("✅ DB ready");
 
