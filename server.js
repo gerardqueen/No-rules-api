@@ -1241,7 +1241,7 @@ app.get("/messages/threads/:otherId", requireAuth, async (req, res) => {
         effective_thread_id AS "threadId",
         COALESCE(MAX(subject), 'Conversation') AS subject,
         MAX(created_at) AS "lastAt",
-        (SELECT content FROM pair_msgs p2 WHERE p2.effective_thread_id = p.effective_thread_id ORDER BY created_at DESC LIMIT 1) AS "lastContent",
+        (SELECT content FROM pair_msgs p2 WHERE p2.effective_thread_id = p.effective_thread_id ORDER BY created_at DESC LIMIT 1) AS "lastMessage",
         SUM(CASE WHEN is_read = FALSE AND to_id = $1 THEN 1 ELSE 0 END)::int AS "unreadCount",
         COUNT(*)::int AS "messageCount"
       FROM pair_msgs p
