@@ -1093,6 +1093,8 @@ async function ensureMessagesTable() {
   }
   try { await pool.query(`ALTER TABLE messages ADD COLUMN message_type VARCHAR(20) DEFAULT 'chat'`); } catch (_) {}
   try { await pool.query(`ALTER TABLE messages ADD COLUMN checkin_id INTEGER`); } catch (_) {}
+  try { await pool.query(`ALTER TABLE messages ADD COLUMN thread_id BIGINT`); } catch (_) {}
+  try { await pool.query(`ALTER TABLE messages ADD COLUMN subject TEXT`); } catch (_) {}
   messagesTableReady = true;
 }
 
@@ -1220,6 +1222,90 @@ app.get("/messages-unread", requireAuth, async (req, res) => {
   }
 });
 
+app.get("/messages/threads/:otherId", requireAuth, async (req, res) => {
+  try {
+    await ensureMessagesTable();
+    const me = req.user.id;
+    const other = Number(req.params.otherId);
+    if (!Number.isInteger(other)) return res.status(400).json({ error: "Invalid user id" });
+    // Group messages by thread_id (or by subject for legacy rows). One thread per (from/to pair, thread_id).
+    const result = await pool.query(`
+      WITH pair_msgs AS (
+        SELECT m.id, m.from_id, m.to_id, m.content, m.subject, m.thread_id,
+               m.is_read, m.message_type, m.created_at,
+               COALESCE(m.thread_id, -m.id) AS effective_thread_id
+        FROM messages m
+        WHERE (m.from_id=$1 AND m.to_id=$2) OR (m.from_id=$2 AND m.to_id=$1)
+      )
+      SELECT
+        effective_thread_id AS "threadId",
+        COALESCE(MAX(subject), 'Conversation') AS subject,
+        MAX(created_at) AS "lastAt",
+        (SELECT content FROM pair_msgs p2 WHERE p2.effective_thread_id = p.effective_thread_id ORDER BY created_at DESC LIMIT 1) AS "lastContent",
+        SUM(CASE WHEN is_read = FALSE AND to_id = $1 THEN 1 ELSE 0 END)::int AS "unreadCount",
+        COUNT(*)::int AS "messageCount"
+      FROM pair_msgs p
+      GROUP BY effective_thread_id
+      ORDER BY "lastAt" DESC
+      LIMIT 100
+    `, [me, other]);
+    return res.json(result.rows.map(r => ({ ...r, otherId: other })));
+  } catch (err) {
+    console.error("Threads list error:", err);
+    return res.status(500).json({ error: "Could not fetch threads" });
+  }
+});
+
+app.get("/messages/thread/:otherId/:threadId", requireAuth, async (req, res) => {
+  try {
+    await ensureMessagesTable();
+    const me = req.user.id;
+    const other = Number(req.params.otherId);
+    const threadId = Number(req.params.threadId);
+    if (!Number.isInteger(other) || !Number.isInteger(threadId)) return res.status(400).json({ error: "Invalid id" });
+    // If threadId is positive, it's a real thread_id. If negative, it refers to a legacy message (by -id).
+    let sql, params;
+    if (threadId > 0) {
+      sql = `
+        SELECT m.id, m.from_id AS "fromId", m.to_id AS "toId", m.content, m.subject,
+               m.thread_id AS "threadId", m.created_at, m.message_type AS "messageType",
+               u.name AS "fromName"
+        FROM messages m
+        LEFT JOIN users u ON u.id = m.from_id
+        WHERE m.thread_id = $1
+          AND ((m.from_id = $2 AND m.to_id = $3) OR (m.from_id = $3 AND m.to_id = $2))
+        ORDER BY m.created_at ASC
+      `;
+      params = [threadId, me, other];
+    } else {
+      // legacy: a single message, stored as its own "thread" via negative id
+      sql = `
+        SELECT m.id, m.from_id AS "fromId", m.to_id AS "toId", m.content, m.subject,
+               m.thread_id AS "threadId", m.created_at, m.message_type AS "messageType",
+               u.name AS "fromName"
+        FROM messages m
+        LEFT JOIN users u ON u.id = m.from_id
+        WHERE m.id = $1
+          AND ((m.from_id = $2 AND m.to_id = $3) OR (m.from_id = $3 AND m.to_id = $2))
+      `;
+      params = [-threadId, me, other];
+    }
+    const result = await pool.query(sql, params);
+    // Mark as read
+    try {
+      if (threadId > 0) {
+        await pool.query(`UPDATE messages SET is_read = TRUE WHERE thread_id = $1 AND to_id = $2 AND is_read = FALSE`, [threadId, me]);
+      } else {
+        await pool.query(`UPDATE messages SET is_read = TRUE WHERE id = $1 AND to_id = $2 AND is_read = FALSE`, [-threadId, me]);
+      }
+    } catch {}
+    return res.json(result.rows.map(r => ({ ...r, fromName: r.fromName || "Unknown" })));
+  } catch (err) {
+    console.error("Thread fetch error:", err);
+    return res.status(500).json({ error: "Could not fetch thread" });
+  }
+});
+
 app.get("/messages/:otherId", requireAuth, async (req, res) => {
   try {
     await ensureMessagesTable();
@@ -1261,18 +1347,29 @@ app.post("/messages/:toId", requireAuth, async (req, res) => {
     await ensureMessagesTable();
     const fromId = req.user.id;
     const toId = Number(req.params.toId);
-    const { content, messageType, checkinId } = req.body || {};
+    const { content, messageType, checkinId, threadId, subject } = req.body || {};
     if (!content || typeof content !== "string" || !content.trim()) {
       return res.status(400).json({ error: "Message content is required" });
     }
     const msgType = messageType === "checkin" ? "checkin" : "chat";
+    const cleanSubject = subject ? String(subject).slice(0, 200) : null;
+    const reqThreadId = Number.isInteger(Number(threadId)) && Number(threadId) > 0 ? Number(threadId) : null;
+
     const result = await pool.query(
-      `INSERT INTO messages (from_id, to_id, content, message_type, checkin_id, created_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())
-       RETURNING id, from_id AS "fromId", to_id AS "toId", content, message_type AS "messageType", checkin_id AS "checkinId", created_at`,
-      [fromId, toId, content.trim().slice(0, 5000), msgType, checkinId || null]
+      `INSERT INTO messages (from_id, to_id, content, message_type, checkin_id, thread_id, subject, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       RETURNING id, from_id AS "fromId", to_id AS "toId", content, message_type AS "messageType",
+                 checkin_id AS "checkinId", thread_id AS "threadId", subject, created_at`,
+      [fromId, toId, content.trim().slice(0, 5000), msgType, checkinId || null, reqThreadId, cleanSubject]
     );
-    const row = result.rows[0];
+    let row = result.rows[0];
+
+    // If no threadId provided, set thread_id = id so this message starts a new thread
+    if (!reqThreadId) {
+      await pool.query(`UPDATE messages SET thread_id = $1 WHERE id = $1`, [row.id]);
+      row.threadId = row.id;
+    }
+
     const fromUser = await pool.query("SELECT name FROM users WHERE id=$1", [fromId]);
     return res.json({ ...row, fromName: fromUser.rows[0]?.name || "Unknown" });
   } catch (err) {
