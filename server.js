@@ -1796,6 +1796,85 @@ app.delete("/meals/:athleteId/:id", requireAuth, requireSelfOrCoachOfAthlete, as
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// OPEN FOOD FACTS PROXY — barcode lookup + text search (UK product database)
+// ─────────────────────────────────────────────────────────────────────────────
+function fetchJson(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { "User-Agent": "NoRulesNutrition/1.0 (+https://no-rules-api-production.up.railway.app)" } }, (resp) => {
+      let raw = "";
+      resp.on("data", (c) => (raw += c));
+      resp.on("end", () => {
+        try { resolve(JSON.parse(raw)); }
+        catch (e) { reject(new Error("Invalid JSON from " + url)); }
+      });
+    }).on("error", reject);
+  });
+}
+
+function offProductToFood(p) {
+  if (!p) return null;
+  const n = p.nutriments || {};
+  const cal = Math.round(Number(n["energy-kcal_100g"] || n["energy-kcal"] || (n.energy_100g ? n.energy_100g / 4.184 : 0)) || 0);
+  const prot = Math.round(Number(n.proteins_100g || n.proteins || 0));
+  const carb = Math.round(Number(n.carbohydrates_100g || n.carbohydrates || 0));
+  const fat = Math.round(Number(n.fat_100g || n.fat || 0));
+  const fibre = Math.round(Number(n.fiber_100g || n.fiber || 0));
+  const name = p.product_name || p.product_name_en || p.generic_name || "";
+  if (!name) return null;
+  return {
+    barcode: p.code || null,
+    name,
+    brand: (p.brands || "").split(",")[0].trim() || null,
+    calories: cal,
+    protein: prot,
+    carbs: carb,
+    fat: fat,
+    fibre: fibre,
+    image: p.image_front_small_url || p.image_url || null,
+    servings: [["100g", 100]],
+  };
+}
+
+app.get("/off/barcode/:code", requireAuth, async (req, res) => {
+  try {
+    const clean = String(req.params.code || "").replace(/\D/g, "");
+    if (clean.length < 8) return res.json({ found: false, error: "Invalid barcode" });
+    const url = `https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(clean)}.json`;
+    const data = await fetchJson(url);
+    if (data.status !== 1 || !data.product) return res.json({ found: false, barcode: clean });
+    const food = offProductToFood(data.product);
+    if (!food || (food.calories === 0 && food.protein === 0 && food.carbs === 0 && food.fat === 0)) {
+      return res.json({ found: false, barcode: clean });
+    }
+    return res.json({ found: true, ...food, barcode: clean });
+  } catch (err) {
+    console.error("OFF barcode error:", err.message);
+    return res.json({ found: false, error: "OpenFoodFacts unavailable" });
+  }
+});
+
+app.get("/off/search", requireAuth, async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    if (q.length < 2) return res.json({ products: [] });
+    const url = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=20&fields=code,product_name,product_name_en,brands,nutriments,image_front_small_url`;
+    const data = await fetchJson(url);
+    const products = Array.isArray(data.products) ? data.products : [];
+    const mapped = products.map(offProductToFood).filter((p) => p && p.calories > 0);
+    return res.json({ products: mapped });
+  } catch (err) {
+    console.error("OFF search error:", err.message);
+    return res.json({ products: [], error: "OpenFoodFacts unavailable" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MISSING-ENDPOINT STUBS — return empty results so the UI doesn't 404
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/coach-videos/:athleteId", requireAuth, async (req, res) => res.json([]));
+app.post("/auth/logout", requireAuth, async (req, res) => res.json({ ok: true }));
+
 app.get("/health", (req, res) => {
   return res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
