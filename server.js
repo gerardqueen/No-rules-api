@@ -1967,9 +1967,119 @@ app.get("/off/search", requireAuth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MISSING-ENDPOINT STUBS — return empty results so the UI doesn't 404
+// COACH VIDEOS — coach posts YouTube links, athlete watches in their dashboard
 // ─────────────────────────────────────────────────────────────────────────────
-app.get("/coach-videos/:athleteId", requireAuth, async (req, res) => res.json([]));
+let coachVideosTableReady = false;
+async function ensureCoachVideosTable() {
+  if (coachVideosTableReady) return;
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS coach_videos (
+        id BIGSERIAL PRIMARY KEY,
+        athlete_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        youtube_id TEXT NOT NULL,
+        category TEXT DEFAULT 'General',
+        notes TEXT,
+        created_by INTEGER,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_coach_videos_athlete ON coach_videos (athlete_id, created_at DESC)`); } catch {}
+  } catch (e) { console.error("ensureCoachVideosTable error:", e); }
+  coachVideosTableReady = true;
+}
+
+// Extract the 11-character YouTube video id from common URL formats
+function extractYoutubeId(input) {
+  if (!input) return null;
+  const s = String(input).trim();
+  // Already an ID?
+  if (/^[A-Za-z0-9_-]{11}$/.test(s)) return s;
+  // watch?v=ID
+  let m = s.match(/[?&]v=([A-Za-z0-9_-]{11})/);
+  if (m) return m[1];
+  // youtu.be/ID
+  m = s.match(/youtu\.be\/([A-Za-z0-9_-]{11})/);
+  if (m) return m[1];
+  // /embed/ID or /shorts/ID or /v/ID
+  m = s.match(/\/(?:embed|shorts|v)\/([A-Za-z0-9_-]{11})/);
+  if (m) return m[1];
+  return null;
+}
+
+app.get("/coach-videos/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    await ensureCoachVideosTable();
+    const athleteId = Number(req.params.athleteId);
+    const result = await pool.query(
+      `SELECT cv.id, cv.athlete_id, cv.title, cv.youtube_id, cv.category, cv.notes,
+              cv.created_by, cv.created_at, u.name AS coach_name
+       FROM coach_videos cv
+       LEFT JOIN users u ON u.id = cv.created_by
+       WHERE cv.athlete_id = $1
+       ORDER BY cv.created_at DESC
+       LIMIT 100`,
+      [athleteId]
+    );
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("Get coach videos error:", err);
+    return res.status(500).json({ error: "Could not fetch videos" });
+  }
+});
+
+app.post("/coach-videos/:athleteId", requireAuth, requireCoach, async (req, res) => {
+  try {
+    await ensureCoachVideosTable();
+    const athleteId = Number(req.params.athleteId);
+    const ok = await coachOwnsAthlete(req.user.id, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+
+    const { title, url, youtubeId, category, notes } = req.body || {};
+    const ytId = extractYoutubeId(youtubeId || url);
+    if (!ytId) return res.status(400).json({ error: "Invalid YouTube URL or video ID" });
+    if (!title || typeof title !== "string" || !title.trim()) {
+      return res.status(400).json({ error: "Title is required" });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO coach_videos (athlete_id, title, youtube_id, category, notes, created_by, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())
+       RETURNING id, athlete_id, title, youtube_id, category, notes, created_by, created_at`,
+      [
+        athleteId,
+        String(title).trim().slice(0, 160),
+        ytId,
+        category ? String(category).slice(0, 40) : "General",
+        notes ? String(notes).slice(0, 1000) : null,
+        req.user.id,
+      ]
+    );
+    const row = result.rows[0];
+    const coachName = (await pool.query("SELECT name FROM users WHERE id=$1", [req.user.id])).rows[0]?.name || "Coach";
+    return res.status(201).json({ ...row, coach_name: coachName });
+  } catch (err) {
+    console.error("Create coach video error:", err);
+    return res.status(500).json({ error: "Could not create video" });
+  }
+});
+
+app.delete("/coach-videos/:athleteId/:id", requireAuth, requireCoach, async (req, res) => {
+  try {
+    await ensureCoachVideosTable();
+    const athleteId = Number(req.params.athleteId);
+    const id = Number(req.params.id);
+    const ok = await coachOwnsAthlete(req.user.id, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+    await pool.query(`DELETE FROM coach_videos WHERE id = $1 AND athlete_id = $2`, [id, athleteId]);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Delete coach video error:", err);
+    return res.status(500).json({ error: "Could not delete video" });
+  }
+});
+
 app.post("/auth/logout", requireAuth, async (req, res) => res.json({ ok: true }));
 
 app.get("/health", (req, res) => {
