@@ -146,6 +146,16 @@ async function coachOwnsAthlete(coachId, athleteId) {
   return !!r.rows[0];
 }
 
+// Admin bypass: admins have access to every athlete regardless of coach assignment
+async function coachOrAdminCanAccessAthlete(user, athleteId) {
+  if (!user) return false;
+  if (user.role === "admin") {
+    const r = await pool.query(`SELECT id FROM users WHERE id = $1`, [athleteId]);
+    return !!r.rows[0];
+  }
+  return coachOwnsAthlete(user.id, athleteId);
+}
+
 async function requireSelfOrCoachOfAthlete(req, res, next) {
   try {
     const athleteId = Number(req.params.athleteId);
@@ -156,9 +166,9 @@ async function requireSelfOrCoachOfAthlete(req, res, next) {
     // ✅ any logged-in user can access their own records
     if (req.user?.id === athleteId) return next();
 
-    // ✅ coaches/admins can access users assigned to them
+    // ✅ coaches/admins can access users assigned to them (admins = all)
     if (req.user?.role === "coach" || req.user?.role === "admin") {
-      const ok = await coachOwnsAthlete(req.user.id, athleteId);
+      const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
       if (!ok) return res.status(404).json({ error: "Athlete not found" });
       return next();
     }
@@ -309,7 +319,7 @@ app.delete("/athletes/:athleteId", requireAuth, requireCoach, async (req, res) =
   if (!Number.isInteger(athleteId) || athleteId <= 0) return res.status(400).json({ error: "Invalid athlete id" });
 
   try {
-    const ok = await coachOwnsAthlete(req.user.id, athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
     if (!ok) return res.status(404).json({ error: "Athlete not found" });
 
     const client = await pool.connect();
@@ -382,7 +392,7 @@ app.put("/macro-plans/:athleteId", requireAuth, requireCoach, async (req, res) =
       return res.status(400).json({ error: "plans must be an array" });
     }
 
-    const ok = await coachOwnsAthlete(req.user.id, athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
     if (!ok) return res.status(404).json({ error: "Athlete not found" });
 
     for (const p of plans) {
@@ -550,7 +560,7 @@ app.put("/macro-targets/:athleteId", requireAuth, requireCoach, async (req, res)
     const entries = req.body?.entries;
     if (!Array.isArray(entries) || entries.length === 0) return res.status(400).json({ error: "entries must be a non-empty array" });
 
-    const ok = await coachOwnsAthlete(req.user.id, athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
     if (!ok) return res.status(404).json({ error: "Athlete not found" });
 
     for (const e of entries) {
@@ -782,7 +792,7 @@ app.get("/checkins/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async 
 app.post("/checkins/:athleteId", requireAuth, requireCoach, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
-    const ok = await coachOwnsAthlete(req.user.id, athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
     if (!ok) return res.status(404).json({ error: "Athlete not found" });
 
     const { date, title, linkUrl, notes } = req.body || {};
@@ -810,7 +820,7 @@ app.delete("/checkins/:athleteId/:id", requireAuth, requireCoach, async (req, re
   try {
     const athleteId = Number(req.params.athleteId);
     const id = Number(req.params.id);
-    const ok = await coachOwnsAthlete(req.user.id, athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
     if (!ok) return res.status(404).json({ error: "Athlete not found" });
 
     await pool.query('DELETE FROM coach_checkins WHERE id = $1 AND athlete_id = $2', [id, athleteId]);
@@ -1228,27 +1238,44 @@ app.get("/messages/threads/:otherId", requireAuth, async (req, res) => {
     const me = req.user.id;
     const other = Number(req.params.otherId);
     if (!Number.isInteger(other)) return res.status(400).json({ error: "Invalid user id" });
-    // Group messages by thread_id (or by subject for legacy rows). One thread per (from/to pair, thread_id).
+
     const result = await pool.query(`
       WITH pair_msgs AS (
-        SELECT m.id, m.from_id, m.to_id, m.content, m.subject, m.thread_id,
-               m.is_read, m.message_type, m.created_at,
+        SELECT m.id, m.from_id, m.to_id, m.content, m.subject,
+               m.is_read, m.created_at,
                COALESCE(m.thread_id, -m.id) AS effective_thread_id
         FROM messages m
-        WHERE (m.from_id=$1 AND m.to_id=$2) OR (m.from_id=$2 AND m.to_id=$1)
+        WHERE (m.from_id = $1 AND m.to_id = $2)
+           OR (m.from_id = $2 AND m.to_id = $1)
+      ),
+      last_per_thread AS (
+        SELECT DISTINCT ON (effective_thread_id)
+               effective_thread_id,
+               content AS last_content,
+               created_at AS last_at
+        FROM pair_msgs
+        ORDER BY effective_thread_id, created_at DESC
+      ),
+      summary AS (
+        SELECT effective_thread_id,
+               COALESCE(MAX(subject), 'Conversation') AS subject,
+               SUM(CASE WHEN is_read = FALSE AND to_id = $1 THEN 1 ELSE 0 END)::int AS unread_count,
+               COUNT(*)::int AS message_count
+        FROM pair_msgs
+        GROUP BY effective_thread_id
       )
-      SELECT
-        effective_thread_id AS "threadId",
-        COALESCE(MAX(subject), 'Conversation') AS subject,
-        MAX(created_at) AS "lastAt",
-        (SELECT content FROM pair_msgs p2 WHERE p2.effective_thread_id = p.effective_thread_id ORDER BY created_at DESC LIMIT 1) AS "lastMessage",
-        SUM(CASE WHEN is_read = FALSE AND to_id = $1 THEN 1 ELSE 0 END)::int AS "unreadCount",
-        COUNT(*)::int AS "messageCount"
-      FROM pair_msgs p
-      GROUP BY effective_thread_id
-      ORDER BY "lastAt" DESC
+      SELECT s.effective_thread_id AS "threadId",
+             s.subject,
+             l.last_at AS "lastAt",
+             l.last_content AS "lastMessage",
+             s.unread_count AS "unreadCount",
+             s.message_count AS "messageCount"
+      FROM summary s
+      JOIN last_per_thread l USING (effective_thread_id)
+      ORDER BY l.last_at DESC
       LIMIT 100
     `, [me, other]);
+
     return res.json(result.rows.map(r => ({ ...r, otherId: other })));
   } catch (err) {
     console.error("Threads list error:", err);
@@ -1985,6 +2012,14 @@ async function ensureCoachVideosTable() {
         created_at TIMESTAMPTZ DEFAULT NOW()
       )
     `);
+    // Bring older schemas up to date
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN title TEXT`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN youtube_id TEXT`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN category TEXT DEFAULT 'General'`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN notes TEXT`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN created_by INTEGER`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN created_at TIMESTAMPTZ DEFAULT NOW()`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN athlete_id INTEGER`); } catch {}
     try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_coach_videos_athlete ON coach_videos (athlete_id, created_at DESC)`); } catch {}
   } catch (e) { console.error("ensureCoachVideosTable error:", e); }
   coachVideosTableReady = true;
@@ -2033,7 +2068,7 @@ app.post("/coach-videos/:athleteId", requireAuth, requireCoach, async (req, res)
   try {
     await ensureCoachVideosTable();
     const athleteId = Number(req.params.athleteId);
-    const ok = await coachOwnsAthlete(req.user.id, athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
     if (!ok) return res.status(404).json({ error: "Athlete not found" });
 
     const { title, url, youtubeId, category, notes } = req.body || {};
@@ -2070,7 +2105,7 @@ app.delete("/coach-videos/:athleteId/:id", requireAuth, requireCoach, async (req
     await ensureCoachVideosTable();
     const athleteId = Number(req.params.athleteId);
     const id = Number(req.params.id);
-    const ok = await coachOwnsAthlete(req.user.id, athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
     if (!ok) return res.status(404).json({ error: "Athlete not found" });
     await pool.query(`DELETE FROM coach_videos WHERE id = $1 AND athlete_id = $2`, [id, athleteId]);
     return res.json({ ok: true });
