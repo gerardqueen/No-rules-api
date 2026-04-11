@@ -919,6 +919,7 @@ app.put("/food-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async
       protein_g: Number(f.protein_g ?? f.protein ?? 0),
       carbs_g: Number(f.carbs_g ?? f.carbs ?? 0),
       fat_g: Number(f.fat_g ?? f.fat ?? 0),
+      meal: String(f.meal || "Snack").slice(0, 24),
       source: String(f.source || "manual").slice(0, 24),
       created_at: f.created_at || null,
     }));
