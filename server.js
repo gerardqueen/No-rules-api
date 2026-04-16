@@ -1981,9 +1981,15 @@ app.get("/off/barcode/:code", requireAuth, async (req, res) => {
   try {
     const clean = String(req.params.code || "").replace(/\D/g, "");
     if (clean.length < 8) return res.json({ found: false, error: "Invalid barcode" });
-    const url = `https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(clean)}.json`;
-    const data = await fetchJson(url);
-    if (data.status !== 1 || !data.product) return res.json({ found: false, barcode: clean });
+    // Prefer UK endpoint for UK supermarket products, fall back to global
+    const ukUrl = `https://uk.openfoodfacts.org/api/v2/product/${encodeURIComponent(clean)}.json`;
+    const worldUrl = `https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(clean)}.json`;
+    let data = null;
+    try { data = await fetchJson(ukUrl); } catch (_) {}
+    if (!data || data.status !== 1 || !data.product) {
+      try { data = await fetchJson(worldUrl); } catch (_) {}
+    }
+    if (!data || data.status !== 1 || !data.product) return res.json({ found: false, barcode: clean });
     const food = offProductToFood(data.product);
     if (!food || (food.calories === 0 && food.protein === 0 && food.carbs === 0 && food.fat === 0)) {
       return res.json({ found: false, barcode: clean });
@@ -1999,10 +2005,18 @@ app.get("/off/search", requireAuth, async (req, res) => {
   try {
     const q = String(req.query.q || "").trim();
     if (q.length < 2) return res.json({ products: [] });
-    const url = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=20&fields=code,product_name,product_name_en,brands,nutriments,image_front_small_url`;
-    const data = await fetchJson(url);
-    const products = Array.isArray(data.products) ? data.products : [];
-    const mapped = products.map(offProductToFood).filter((p) => p && p.calories > 0);
+    // Prefer UK region for UK-centric product names; fall back to world if no results
+    const ukUrl = `https://uk.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=20&fields=code,product_name,product_name_en,brands,nutriments,image_front_small_url`;
+    const worldUrl = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=20&fields=code,product_name,product_name_en,brands,nutriments,image_front_small_url`;
+    let data = null;
+    try { data = await fetchJson(ukUrl); } catch (_) {}
+    let products = Array.isArray(data?.products) ? data.products : [];
+    let mapped = products.map(offProductToFood).filter((p) => p && p.calories > 0);
+    if (mapped.length === 0) {
+      try { data = await fetchJson(worldUrl); } catch (_) {}
+      products = Array.isArray(data?.products) ? data.products : [];
+      mapped = products.map(offProductToFood).filter((p) => p && p.calories > 0);
+    }
     return res.json({ products: mapped });
   } catch (err) {
     console.error("OFF search error:", err.message);
