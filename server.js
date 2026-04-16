@@ -946,6 +946,56 @@ app.put("/food-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async
   }
 });
 
+// Delete a single date's food log entirely (for "clear day" UI)
+app.delete("/food-logs/:athleteId/:date", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const date = String(req.params.date || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: "date must be YYYY-MM-DD" });
+    await pool.query(`DELETE FROM food_logs WHERE athlete_id=$1 AND date=$2::date`, [athleteId, date]);
+    return res.json({ ok: true, deleted: { athleteId, date } });
+  } catch (err) {
+    console.error("Delete food log error:", err);
+    return res.status(500).json({ error: "Could not delete food log" });
+  }
+});
+
+// Purge food log entries by source label (e.g. "mfp"). Strips matching items
+// from each day's foods array; deletes the day row entirely if empty after.
+// Useful for cleaning up legacy MFP imports that the coach/athlete no longer wants.
+app.delete("/food-logs/:athleteId/source/:source", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const source = String(req.params.source || "").toLowerCase();
+    if (!source) return res.status(400).json({ error: "source is required" });
+    const rows = await pool.query(
+      `SELECT date::text AS date, foods FROM food_logs WHERE athlete_id=$1`,
+      [athleteId]
+    );
+    let stripped = 0, daysAffected = 0, daysDeleted = 0;
+    for (const row of rows.rows) {
+      const original = Array.isArray(row.foods) ? row.foods : [];
+      const filtered = original.filter(f => String(f.source || "").toLowerCase() !== source);
+      if (filtered.length === original.length) continue;
+      stripped += original.length - filtered.length;
+      daysAffected += 1;
+      if (filtered.length === 0) {
+        await pool.query(`DELETE FROM food_logs WHERE athlete_id=$1 AND date=$2::date`, [athleteId, row.date]);
+        daysDeleted += 1;
+      } else {
+        await pool.query(
+          `UPDATE food_logs SET foods=$1::jsonb, updated_at=NOW() WHERE athlete_id=$2 AND date=$3::date`,
+          [JSON.stringify(filtered), athleteId, row.date]
+        );
+      }
+    }
+    return res.json({ ok: true, source, stripped, daysAffected, daysDeleted });
+  } catch (err) {
+    console.error("Purge food log by source error:", err);
+    return res.status(500).json({ error: "Could not purge by source" });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CALENDAR EVENTS (Athlete-created + coach-created) — date/time based
 // ─────────────────────────────────────────────────────────────────────────────
