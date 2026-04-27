@@ -22,8 +22,12 @@ app.use(
   cors({
     origin: [
       "https://gerardqueen.github.io",
+      "https://norulenutrition.uk",
+      "https://www.norulenutrition.uk",
       "http://localhost:5173",
       "http://localhost:3000",
+      "capacitor://localhost",
+      "http://localhost",
     ],
     credentials: true,
   })
