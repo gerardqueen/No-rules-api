@@ -73,11 +73,15 @@ module.exports = function registerFpRoutes(app, { pool, requireAuth, requireCoac
     try {
       let rows;
       if (req.user.role === "admin") {
+        // Admin sees every FP-managed athlete (across all coaches),
+        // but NOT athletes from other apps that share this users table.
+        // Membership in fp_coach_athletes is what makes someone an FP athlete.
         const r = await pool.query(
-          `SELECT u.id, u.email, u.name, u.role, u.password_reset_allowed,
+          `SELECT DISTINCT u.id, u.email, u.name, u.role, u.password_reset_allowed,
                   u.created_at,
                   (SELECT MAX(date) FROM fp_workouts WHERE athlete_id = u.id) AS last_workout_date
            FROM users u
+           JOIN fp_coach_athletes ca ON ca.athlete_id = u.id
            WHERE u.role = 'athlete'
            ORDER BY u.name ASC`
         );
