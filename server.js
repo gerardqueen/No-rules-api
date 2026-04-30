@@ -2207,6 +2207,14 @@ app.get("/health", (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// FITNESS PACIFIC ROUTES — registered from a separate module (server-fp.js)
+// All FP-specific endpoints live under /fp/* and use the same pool + auth
+// helpers from this file.
+// ─────────────────────────────────────────────────────────────────────────────
+const registerFpRoutes = require("./server-fp.js");
+registerFpRoutes(app, { pool, requireAuth, requireCoach, requireAdmin });
+
+// ─────────────────────────────────────────────────────────────────────────────
 // START + AUTO TABLES
 // ─────────────────────────────────────────────────────────────────────────────
 app.listen(PORT, async () => {
