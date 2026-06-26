@@ -433,6 +433,72 @@ app.put("/macro-plans/:athleteId", requireAuth, requireCoach, async (req, res) =
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SHOPPING LIST (per-athlete, synced across app + website + all devices)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET the athlete's shopping list (athlete reads their own; coach can view too)
+app.get("/shopping-list/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const result = await pool.query(
+      `SELECT id, name, qty, checked, position
+       FROM shopping_list
+       WHERE athlete_id = $1
+       ORDER BY position ASC, id ASC`,
+      [athleteId]
+    );
+    return res.json(
+      result.rows.map((r) => ({
+        id: String(r.id),
+        name: r.name,
+        qty: r.qty,
+        checked: r.checked,
+      }))
+    );
+  } catch (err) {
+    console.error("Get shopping list error:", err);
+    return res.status(500).json({ error: "Could not fetch shopping list" });
+  }
+});
+
+// PUT replaces the athlete's whole shopping list with the array provided.
+app.put("/shopping-list/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  const athleteId = Number(req.params.athleteId);
+  const items = req.body?.items;
+
+  if (!Array.isArray(items)) {
+    return res.status(400).json({ error: "items must be an array" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`DELETE FROM shopping_list WHERE athlete_id = $1`, [athleteId]);
+    let position = 0;
+    for (const it of items) {
+      const name = String(it?.name || "").trim();
+      if (!name) continue;
+      const qty = Number.isFinite(Number(it?.qty)) ? Math.max(1, Math.round(Number(it.qty))) : 1;
+      const checked = !!it?.checked;
+      await client.query(
+        `INSERT INTO shopping_list (athlete_id, name, qty, checked, position, updated_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())`,
+        [athleteId, name, qty, checked, position]
+      );
+      position += 1;
+    }
+    await client.query("COMMIT");
+    return res.json({ ok: true });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Update shopping list error:", err);
+    return res.status(500).json({ error: "Could not update shopping list" });
+  } finally {
+    client.release();
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DAILY TOTALS (Macros Consumed) — calendar/date based
 app.get("/daily-totals/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
@@ -2295,6 +2361,19 @@ app.listen(PORT, async () => {
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS shopping_list (
+        id SERIAL PRIMARY KEY,
+        athlete_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        qty INTEGER NOT NULL DEFAULT 1,
+        checked BOOLEAN NOT NULL DEFAULT FALSE,
+        position INTEGER NOT NULL DEFAULT 0,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_shopping_list_athlete ON shopping_list (athlete_id)`); } catch {}
 
     
 
