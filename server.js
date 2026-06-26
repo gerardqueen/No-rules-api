@@ -2362,6 +2362,24 @@ app.listen(PORT, async () => {
       );
     `);
 
+    // Shopping list. An earlier/incorrect shopping_list table may already exist
+    // with the wrong columns, which a plain CREATE TABLE IF NOT EXISTS would
+    // skip over. So we self-heal: if the table is missing the expected `name`
+    // column, drop and rebuild it (the shopping list is device-synced and can
+    // be safely regenerated). If the correct table already exists, this is a
+    // no-op and existing data is preserved across deploys.
+    try {
+      const col = await pool.query(
+        `SELECT 1 FROM information_schema.columns
+         WHERE table_name = 'shopping_list' AND column_name = 'name' LIMIT 1`
+      );
+      if (col.rowCount === 0) {
+        await pool.query(`DROP TABLE IF EXISTS shopping_list`);
+      }
+    } catch (e) {
+      console.error("shopping_list schema check failed:", e);
+    }
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS shopping_list (
         id SERIAL PRIMARY KEY,
