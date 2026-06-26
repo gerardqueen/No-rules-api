@@ -214,12 +214,20 @@ app.get("/coach/overview", requireAuth, requireCoach, async (req, res) => {
     const startISO = start.toISOString().slice(0, 10);
     const endISO = end.toISOString().slice(0, 10);
 
+    // Which coach's athletes to show. Coaches see their own; admins may pass
+    // ?coachId= to view any coach's roster (for the manage-coaches overview).
+    let coachId = req.user.id;
+    if (req.query.coachId && req.user.role === "admin") {
+      const requested = Number(req.query.coachId);
+      if (Number.isInteger(requested) && requested > 0) coachId = requested;
+    }
+
     const athletes = await pool.query(
       `SELECT id, name, email, sport
        FROM users
        WHERE coach_id = $1 AND role <> 'coach'
        ORDER BY name ASC`,
-      [req.user.id]
+      [coachId]
     );
 
     const out = [];
@@ -237,14 +245,20 @@ app.get("/coach/overview", requireAuth, requireCoach, async (req, res) => {
 
       const adherQ = await pool.query(
         `WITH dt AS (
-           SELECT date, calories
+           SELECT date, calories, protein_g, carbs_g, fat_g
            FROM daily_totals
            WHERE athlete_id = $1 AND date >= $2::date AND date <= $3::date
          ),
          base AS (
            SELECT dt.date,
                   dt.calories AS consumed,
-                  COALESCE(mt.calories, mp.calories) AS target
+                  dt.protein_g AS consumed_p,
+                  dt.carbs_g AS consumed_c,
+                  dt.fat_g AS consumed_f,
+                  COALESCE(mt.calories, mp.calories) AS target,
+                  mp.protein_g AS target_p,
+                  mp.carbs_g AS target_c,
+                  mp.fat_g AS target_f
            FROM dt
            LEFT JOIN macro_targets mt ON mt.athlete_id = $1 AND mt.date = dt.date
            LEFT JOIN macro_plans mp ON mp.athlete_id = $1 AND mp.day_of_week = (
@@ -259,18 +273,29 @@ app.get("/coach/overview", requireAuth, requireCoach, async (req, res) => {
              END
            )
          )
-         SELECT COUNT(*)::int AS total_days,
-                SUM(CASE WHEN target IS NOT NULL AND target > 0 AND ABS(consumed - target) / target <= 0.10 THEN 1 ELSE 0 END)::int AS adhered_days
-         FROM base
-         WHERE target IS NOT NULL AND target > 0`,
+         SELECT
+           COUNT(*)::int AS days_logged,
+           COUNT(*) FILTER (WHERE target IS NOT NULL AND target > 0)::int AS cal_total,
+           SUM(CASE WHEN target IS NOT NULL AND target > 0 AND ABS(consumed - target) / target <= 0.10 THEN 1 ELSE 0 END)::int AS cal_adhered,
+           COUNT(*) FILTER (WHERE target_p IS NOT NULL AND target_p > 0)::int AS p_total,
+           SUM(CASE WHEN target_p IS NOT NULL AND target_p > 0 AND ABS(consumed_p - target_p) / target_p <= 0.10 THEN 1 ELSE 0 END)::int AS p_adhered,
+           COUNT(*) FILTER (WHERE target_c IS NOT NULL AND target_c > 0)::int AS c_total,
+           SUM(CASE WHEN target_c IS NOT NULL AND target_c > 0 AND ABS(consumed_c - target_c) / target_c <= 0.10 THEN 1 ELSE 0 END)::int AS c_adhered,
+           COUNT(*) FILTER (WHERE target_f IS NOT NULL AND target_f > 0)::int AS f_total,
+           SUM(CASE WHEN target_f IS NOT NULL AND target_f > 0 AND ABS(consumed_f - target_f) / target_f <= 0.10 THEN 1 ELSE 0 END)::int AS f_adhered
+         FROM base`,
         [aid, startISO, endISO]
       );
 
-      const totalDays = adherQ.rows[0]?.total_days ?? 0;
-      const adheredDays = adherQ.rows[0]?.adhered_days ?? 0;
-      const adherencePct = totalDays > 0 ? (adheredDays / totalDays) * 100 : null;
+      const row = adherQ.rows[0] || {};
+      const pct = (adhered, total) => (total > 0 ? (adhered / total) * 100 : null);
+      const daysLogged = row.days_logged ?? 0;
+      const adherencePct = pct(row.cal_adhered, row.cal_total);          // calories (kept for backward-compat)
+      const proteinPct = pct(row.p_adhered, row.p_total);
+      const carbsPct = pct(row.c_adhered, row.c_total);
+      const fatPct = pct(row.f_adhered, row.f_total);
 
-      out.push({ id: aid, name: a.name, email: a.email, sport: a.sport, latestKg, weightChangePct, moodAvg, adherencePct });
+      out.push({ id: aid, name: a.name, email: a.email, sport: a.sport, latestKg, weightChangePct, moodAvg, adherencePct, proteinPct, carbsPct, fatPct, daysLogged });
     }
 
     return res.json({ start: startISO, end: endISO, days, athletes: out });
