@@ -21,15 +21,34 @@ const { pool } = require("./db");
 // ─────────────────────────────────────────────────────────────────────────────
 let fcmMessaging = null;
 try {
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+  // Prefer a base64-encoded key (FIREBASE_SERVICE_ACCOUNT_B64) — it survives
+  // env-var storage with zero newline/multiline mangling. Falls back to raw
+  // JSON in FIREBASE_SERVICE_ACCOUNT for backwards compatibility.
+  let raw = process.env.FIREBASE_SERVICE_ACCOUNT || "";
+  const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_B64;
+  if (b64) {
+    raw = Buffer.from(b64, "base64").toString("utf8");
+  }
   if (raw) {
     const admin = require("firebase-admin");
-    const serviceAccount = JSON.parse(raw);
-    // Env-var storage often mangles the multi-line private_key: literal "\n"
-    // sequences need turning back into real newlines, or the crypto layer fails
-    // with "Cannot read properties of undefined (reading 'length')".
+    let serviceAccount;
+    try {
+      serviceAccount = JSON.parse(raw);
+    } catch (parseErr) {
+      throw new Error("Service account is not valid JSON: " + parseErr.message);
+    }
+    console.log(
+      "Service account fields — project_id:", !!serviceAccount.project_id,
+      "client_email:", !!serviceAccount.client_email,
+      "private_key present:", !!serviceAccount.private_key,
+      "private_key length:", serviceAccount.private_key ? serviceAccount.private_key.length : 0
+    );
+    // If the private key has literal "\n" sequences, restore real newlines.
     if (serviceAccount.private_key && serviceAccount.private_key.includes("\\n")) {
       serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
+    }
+    if (!serviceAccount.private_key || !serviceAccount.client_email || !serviceAccount.project_id) {
+      throw new Error("Service account missing required field(s) — check the value was stored whole.");
     }
     if (!admin.apps.length) {
       admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
@@ -37,7 +56,7 @@ try {
     fcmMessaging = admin.messaging();
     console.log("Firebase Admin initialised — push notifications enabled.");
   } else {
-    console.log("FIREBASE_SERVICE_ACCOUNT not set — push notifications disabled.");
+    console.log("No Firebase service account set — push notifications disabled.");
   }
 } catch (e) {
   console.error("Firebase Admin init failed — push disabled:", e.message);
