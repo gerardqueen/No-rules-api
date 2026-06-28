@@ -13,6 +13,84 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { pool } = require("./db");
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PUSH NOTIFICATIONS (Firebase Admin)
+// Reads the service-account JSON from the FIREBASE_SERVICE_ACCOUNT env var so no
+// secret file lives in the repo. If the var is missing the server still boots —
+// push just becomes a no-op (useful before the key is configured).
+// ─────────────────────────────────────────────────────────────────────────────
+let fcmMessaging = null;
+try {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (raw) {
+    const admin = require("firebase-admin");
+    const serviceAccount = JSON.parse(raw);
+    if (!admin.apps.length) {
+      admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    }
+    fcmMessaging = admin.messaging();
+    console.log("Firebase Admin initialised — push notifications enabled.");
+  } else {
+    console.log("FIREBASE_SERVICE_ACCOUNT not set — push notifications disabled.");
+  }
+} catch (e) {
+  console.error("Firebase Admin init failed — push disabled:", e.message);
+  fcmMessaging = null;
+}
+
+// Send a push to every device registered to a user. Looks up the user's tokens,
+// sends, and prunes any tokens Firebase reports as permanently invalid (e.g.
+// the app was uninstalled). Safe to call even when push is disabled.
+async function sendPushToUser(userId, title, body, data = {}) {
+  try {
+    if (!fcmMessaging) return;
+    const { rows } = await pool.query(
+      "SELECT token FROM device_tokens WHERE user_id = $1",
+      [userId]
+    );
+    const tokens = rows.map((r) => r.token).filter(Boolean);
+    if (tokens.length === 0) return;
+
+    // Stringify data values (FCM requires string values in the data payload).
+    const dataStr = {};
+    for (const k of Object.keys(data)) dataStr[k] = String(data[k]);
+
+    const message = {
+      notification: { title, body },
+      data: dataStr,
+      tokens,
+      apns: {
+        payload: { aps: { sound: "default", badge: 1 } },
+      },
+    };
+
+    const resp = await fcmMessaging.sendEachForMulticast(message);
+
+    // Remove tokens that are permanently invalid so the table stays clean.
+    if (resp.failureCount > 0) {
+      const dead = [];
+      resp.responses.forEach((r, i) => {
+        if (!r.success) {
+          const code = r.error?.code || "";
+          if (
+            code === "messaging/registration-token-not-registered" ||
+            code === "messaging/invalid-registration-token" ||
+            code === "messaging/invalid-argument"
+          ) {
+            dead.push(tokens[i]);
+          }
+        }
+      });
+      if (dead.length > 0) {
+        await pool.query("DELETE FROM device_tokens WHERE token = ANY($1)", [dead]);
+      }
+    }
+  } catch (e) {
+    // Non-fatal: a push failure should never break the request that triggered it.
+    console.error("sendPushToUser error:", e.message);
+  }
+}
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
@@ -1602,7 +1680,18 @@ app.post("/messages/:toId", requireAuth, async (req, res) => {
     }
 
     const fromUser = await pool.query("SELECT name FROM users WHERE id=$1", [fromId]);
-    return res.json({ ...row, fromName: fromUser.rows[0]?.name || "Unknown" });
+    const fromName = fromUser.rows[0]?.name || "Unknown";
+
+    // Notify the recipient (fire-and-forget; never blocks or breaks the reply).
+    const preview = content.trim().slice(0, 120);
+    sendPushToUser(
+      toId,
+      cleanSubject ? `${fromName}: ${cleanSubject}` : `New message from ${fromName}`,
+      preview,
+      { type: "message", fromId: String(fromId), threadId: String(row.threadId || row.id) }
+    );
+
+    return res.json({ ...row, fromName });
   } catch (err) {
     console.error("Send message error:", err);
     return res.status(500).json({ error: "Could not send message" });
