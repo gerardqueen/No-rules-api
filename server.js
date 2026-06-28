@@ -25,6 +25,12 @@ try {
   if (raw) {
     const admin = require("firebase-admin");
     const serviceAccount = JSON.parse(raw);
+    // Env-var storage often mangles the multi-line private_key: literal "\n"
+    // sequences need turning back into real newlines, or the crypto layer fails
+    // with "Cannot read properties of undefined (reading 'length')".
+    if (serviceAccount.private_key && serviceAccount.private_key.includes("\\n")) {
+      serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
+    }
     if (!admin.apps.length) {
       admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
     }
