@@ -524,6 +524,48 @@ app.put("/shopping-list/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, a
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// DEVICE TOKENS (for push notifications)
+// Each row links an FCM device token to a user so the backend knows which
+// device(s) to push to. A user can have several devices; a token is unique.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Register (or refresh) the calling user's device token. Upsert on token so a
+// token always points at the current user and platform.
+app.post("/device-token", requireAuth, async (req, res) => {
+  try {
+    const token = String(req.body?.token || "").trim();
+    const platform = String(req.body?.platform || "").trim().toLowerCase() || "ios";
+    if (!token) return res.status(400).json({ error: "token is required" });
+
+    await pool.query(
+      `INSERT INTO device_tokens (user_id, token, platform, updated_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (token)
+       DO UPDATE SET user_id = EXCLUDED.user_id, platform = EXCLUDED.platform, updated_at = NOW()`,
+      [req.user.id, token, platform]
+    );
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Register device token error:", err);
+    return res.status(500).json({ error: "Could not register device token" });
+  }
+});
+
+// Remove a device token (e.g. on logout, so the user stops receiving pushes on
+// that device). Only removes if it belongs to the calling user.
+app.delete("/device-token", requireAuth, async (req, res) => {
+  try {
+    const token = String(req.body?.token || "").trim();
+    if (!token) return res.status(400).json({ error: "token is required" });
+    await pool.query(`DELETE FROM device_tokens WHERE token = $1 AND user_id = $2`, [token, req.user.id]);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Remove device token error:", err);
+    return res.status(500).json({ error: "Could not remove device token" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DAILY TOTALS (Macros Consumed) — calendar/date based
 app.get("/daily-totals/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
@@ -2417,6 +2459,17 @@ app.listen(PORT, async () => {
       );
     `);
     try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_shopping_list_athlete ON shopping_list (athlete_id)`); } catch {}
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS device_tokens (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        token TEXT NOT NULL UNIQUE,
+        platform TEXT NOT NULL DEFAULT 'ios',
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_device_tokens_user ON device_tokens (user_id)`); } catch {}
 
     
 
