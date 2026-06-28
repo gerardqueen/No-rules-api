@@ -50,8 +50,22 @@ try {
     if (!serviceAccount.private_key || !serviceAccount.client_email || !serviceAccount.project_id) {
       throw new Error("Service account missing required field(s) — check the value was stored whole.");
     }
+    let adminModuleOk = false;
+    try {
+      adminModuleOk = !!(admin && admin.credential && typeof admin.credential.cert === "function" && typeof admin.initializeApp === "function");
+    } catch { adminModuleOk = false; }
+    console.log("firebase-admin module loaded OK:", adminModuleOk, "version:", (() => { try { return require("firebase-admin/package.json").version; } catch { return "unknown"; } })());
+
+    let cred;
+    try {
+      cred = admin.credential.cert(serviceAccount);
+      console.log("Credential created OK.");
+    } catch (credErr) {
+      throw new Error("credential.cert failed: " + credErr.message);
+    }
     if (!admin.apps.length) {
-      admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+      admin.initializeApp({ credential: cred });
+      console.log("initializeApp OK.");
     }
     fcmMessaging = admin.messaging();
     console.log("Firebase Admin initialised — push notifications enabled.");
@@ -60,6 +74,7 @@ try {
   }
 } catch (e) {
   console.error("Firebase Admin init failed — push disabled:", e.message);
+  console.error("Stack:", e.stack);
   fcmMessaging = null;
 }
 
