@@ -113,7 +113,19 @@ async function sendPushToUser(userId, title, body, data = {}) {
     // Log the specific error for each failed token so delivery issues are visible.
     resp.responses.forEach((r, i) => {
       if (!r.success) {
-        console.log(`[push] user ${userId}: failure — code=${r.error?.code} msg=${r.error?.message}`);
+        const err = r.error || {};
+        console.log(`[push] user ${userId}: failure — code=${err.code} msg=${err.message}`);
+        // Dig into the nested detail to expose the APNs reason (BadDeviceToken /
+        // InvalidProviderToken / DeviceTokenNotForTopic), which pinpoints the cause.
+        try {
+          const info = err.errorInfo ? JSON.stringify(err.errorInfo) : null;
+          const detail = err.detail ? JSON.stringify(err.detail) : null;
+          const raw = err.message || "";
+          console.log(`[push] detail — errorInfo=${info} detail=${detail}`);
+          if (raw.includes("BadDeviceToken")) console.log("[push] APNs reason: BadDeviceToken (environment mismatch — sandbox vs production)");
+          if (raw.includes("InvalidProviderToken")) console.log("[push] APNs reason: InvalidProviderToken (APNs key/Team ID association issue)");
+          if (raw.includes("DeviceTokenNotForTopic")) console.log("[push] APNs reason: DeviceTokenNotForTopic (bundle ID mismatch)");
+        } catch {}
       }
     });
 
