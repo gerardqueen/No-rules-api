@@ -83,12 +83,16 @@ try {
 // the app was uninstalled). Safe to call even when push is disabled.
 async function sendPushToUser(userId, title, body, data = {}) {
   try {
-    if (!fcmMessaging) return;
+    if (!fcmMessaging) {
+      console.log(`[push] skipped for user ${userId}: Firebase not initialised`);
+      return;
+    }
     const { rows } = await pool.query(
       "SELECT token FROM device_tokens WHERE user_id = $1",
       [userId]
     );
     const tokens = rows.map((r) => r.token).filter(Boolean);
+    console.log(`[push] user ${userId}: found ${tokens.length} device token(s)`);
     if (tokens.length === 0) return;
 
     // Stringify data values (FCM requires string values in the data payload).
@@ -105,6 +109,7 @@ async function sendPushToUser(userId, title, body, data = {}) {
     };
 
     const resp = await fcmMessaging.sendEachForMulticast(message);
+    console.log(`[push] user ${userId}: sent — success ${resp.successCount}, failure ${resp.failureCount}`);
 
     // Remove tokens that are permanently invalid so the table stays clean.
     if (resp.failureCount > 0) {
