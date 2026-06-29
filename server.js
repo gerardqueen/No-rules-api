@@ -15,121 +15,60 @@ const { pool } = require("./db");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PUSH NOTIFICATIONS (Firebase Admin)
-// Reads the service-account JSON from the FIREBASE_SERVICE_ACCOUNT env var so no
-// secret file lives in the repo. If the var is missing the server still boots —
-// push just becomes a no-op (useful before the key is configured).
+// Reads the service-account key from FIREBASE_SERVICE_ACCOUNT_B64 (base64, the
+// mangle-proof way to store JSON in an env var) or FIREBASE_SERVICE_ACCOUNT
+// (raw JSON). If neither is set the server still boots and push is a no-op.
 // ─────────────────────────────────────────────────────────────────────────────
 let fcmMessaging = null;
 try {
-  // Prefer a base64-encoded key (FIREBASE_SERVICE_ACCOUNT_B64) — it survives
-  // env-var storage with zero newline/multiline mangling. Falls back to raw
-  // JSON in FIREBASE_SERVICE_ACCOUNT for backwards compatibility.
   let raw = process.env.FIREBASE_SERVICE_ACCOUNT || "";
   const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_B64;
-  if (b64) {
-    raw = Buffer.from(b64, "base64").toString("utf8");
-  }
+  if (b64) raw = Buffer.from(b64, "base64").toString("utf8");
+
   if (raw) {
     const admin = require("firebase-admin");
-    let serviceAccount;
-    try {
-      serviceAccount = JSON.parse(raw);
-    } catch (parseErr) {
-      throw new Error("Service account is not valid JSON: " + parseErr.message);
-    }
-    console.log(
-      "Service account fields — project_id:", !!serviceAccount.project_id,
-      "client_email:", !!serviceAccount.client_email,
-      "private_key present:", !!serviceAccount.private_key,
-      "private_key length:", serviceAccount.private_key ? serviceAccount.private_key.length : 0
-    );
-    // If the private key has literal "\n" sequences, restore real newlines.
+    const serviceAccount = JSON.parse(raw);
+    // Restore real newlines if the private key was stored with literal "\n".
     if (serviceAccount.private_key && serviceAccount.private_key.includes("\\n")) {
       serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
     }
-    if (!serviceAccount.private_key || !serviceAccount.client_email || !serviceAccount.project_id) {
-      throw new Error("Service account missing required field(s) — check the value was stored whole.");
-    }
-    let adminModuleOk = false;
-    try {
-      adminModuleOk = !!(admin && admin.credential && typeof admin.credential.cert === "function" && typeof admin.initializeApp === "function");
-    } catch { adminModuleOk = false; }
-    console.log("firebase-admin module loaded OK:", adminModuleOk, "version:", (() => { try { return require("firebase-admin/package.json").version; } catch { return "unknown"; } })());
-
-    let cred;
-    try {
-      cred = admin.credential.cert(serviceAccount);
-      console.log("Credential created OK.");
-    } catch (credErr) {
-      throw new Error("credential.cert failed: " + credErr.message);
-    }
     if (!admin.apps.length) {
-      admin.initializeApp({ credential: cred });
-      console.log("initializeApp OK.");
+      admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
     }
     fcmMessaging = admin.messaging();
-    console.log("Firebase Admin initialised — push notifications enabled.");
+    console.log("Push notifications enabled.");
   } else {
     console.log("No Firebase service account set — push notifications disabled.");
   }
 } catch (e) {
   console.error("Firebase Admin init failed — push disabled:", e.message);
-  console.error("Stack:", e.stack);
   fcmMessaging = null;
 }
 
 // Send a push to every device registered to a user. Looks up the user's tokens,
-// sends, and prunes any tokens Firebase reports as permanently invalid (e.g.
-// the app was uninstalled). Safe to call even when push is disabled.
+// sends, and prunes any tokens Firebase reports as permanently invalid (e.g. the
+// app was uninstalled). Safe to call even when push is disabled; never throws.
 async function sendPushToUser(userId, title, body, data = {}) {
   try {
-    if (!fcmMessaging) {
-      console.log(`[push] skipped for user ${userId}: Firebase not initialised`);
-      return;
-    }
+    if (!fcmMessaging) return;
     const { rows } = await pool.query(
       "SELECT token FROM device_tokens WHERE user_id = $1",
       [userId]
     );
     const tokens = rows.map((r) => r.token).filter(Boolean);
-    console.log(`[push] user ${userId}: found ${tokens.length} device token(s)`);
     if (tokens.length === 0) return;
 
-    // Stringify data values (FCM requires string values in the data payload).
+    // FCM requires string values in the data payload.
     const dataStr = {};
     for (const k of Object.keys(data)) dataStr[k] = String(data[k]);
 
-    const message = {
+    const resp = await fcmMessaging.sendEachForMulticast({
       notification: { title, body },
       data: dataStr,
       tokens,
-      apns: {
-        payload: { aps: { sound: "default", badge: 1 } },
-      },
-    };
-
-    const resp = await fcmMessaging.sendEachForMulticast(message);
-    console.log(`[push] user ${userId}: sent — success ${resp.successCount}, failure ${resp.failureCount}`);
-    // Log the specific error for each failed token so delivery issues are visible.
-    resp.responses.forEach((r, i) => {
-      if (!r.success) {
-        const err = r.error || {};
-        console.log(`[push] user ${userId}: failure — code=${err.code} msg=${err.message}`);
-        // Dig into the nested detail to expose the APNs reason (BadDeviceToken /
-        // InvalidProviderToken / DeviceTokenNotForTopic), which pinpoints the cause.
-        try {
-          const info = err.errorInfo ? JSON.stringify(err.errorInfo) : null;
-          const detail = err.detail ? JSON.stringify(err.detail) : null;
-          const raw = err.message || "";
-          console.log(`[push] detail — errorInfo=${info} detail=${detail}`);
-          if (raw.includes("BadDeviceToken")) console.log("[push] APNs reason: BadDeviceToken (environment mismatch — sandbox vs production)");
-          if (raw.includes("InvalidProviderToken")) console.log("[push] APNs reason: InvalidProviderToken (APNs key/Team ID association issue)");
-          if (raw.includes("DeviceTokenNotForTopic")) console.log("[push] APNs reason: DeviceTokenNotForTopic (bundle ID mismatch)");
-        } catch {}
-      }
+      apns: { payload: { aps: { sound: "default", badge: 1 } } },
     });
 
-    // Remove tokens that are permanently invalid so the table stays clean.
     if (resp.failureCount > 0) {
       const dead = [];
       resp.responses.forEach((r, i) => {
@@ -139,9 +78,7 @@ async function sendPushToUser(userId, title, body, data = {}) {
             code === "messaging/registration-token-not-registered" ||
             code === "messaging/invalid-registration-token" ||
             code === "messaging/invalid-argument"
-          ) {
-            dead.push(tokens[i]);
-          }
+          ) dead.push(tokens[i]);
         }
       });
       if (dead.length > 0) {
@@ -149,8 +86,15 @@ async function sendPushToUser(userId, title, body, data = {}) {
       }
     }
   } catch (e) {
-    // Non-fatal: a push failure should never break the request that triggered it.
+    // Non-fatal: a push failure must never break the request that triggered it.
     console.error("sendPushToUser error:", e.message);
+  }
+}
+
+// Send the same push to many users (e.g. a coach broadcast). Fire-and-forget.
+async function sendPushToUsers(userIds, title, body, data = {}) {
+  for (const id of userIds) {
+    await sendPushToUser(id, title, body, data);
   }
 }
 
@@ -1087,7 +1031,17 @@ app.post("/checkins/:athleteId", requireAuth, requireCoach, async (req, res) => 
       [athleteId, date, t, l, n, req.user.id]
     );
 
-    return res.json(result.rows[0]);
+    const created = result.rows[0];
+    // Notify the athlete that a check-in is due (fire-and-forget).
+    const coachName = (await pool.query("SELECT name FROM users WHERE id=$1", [req.user.id])).rows[0]?.name || "Your coach";
+    sendPushToUser(
+      athleteId,
+      "Check-in due",
+      `${coachName} scheduled a check-in: ${created.title}`,
+      { type: "checkin", checkinId: String(created.id) }
+    );
+
+    return res.json(created);
   } catch (err) {
     console.error("Create checkin error:", err);
     return res.status(500).json({ error: "Could not create check-in" });
@@ -1463,6 +1417,14 @@ app.post("/messages/broadcast", requireAuth, requireCoach, async (req, res) => {
       );
       sent++;
     }
+    // Notify all recipients of the broadcast (fire-and-forget).
+    const coachName = (await pool.query("SELECT name FROM users WHERE id=$1", [coachId])).rows[0]?.name || "Your coach";
+    sendPushToUsers(
+      athletes.rows.map((a) => a.id),
+      `Message from ${coachName}`,
+      msg.slice(0, 120),
+      { type: "broadcast", fromId: String(coachId) }
+    );
     return res.json({ ok: true, sent });
   } catch (err) {
     console.error("Broadcast error:", err);
@@ -1491,6 +1453,13 @@ app.post("/messages/broadcast-all", requireAuth, requireAdmin, async (req, res) 
       );
       sent++;
     }
+    // Notify all recipients of the admin broadcast (fire-and-forget).
+    sendPushToUsers(
+      athletes.rows.map((a) => a.id),
+      "Announcement",
+      msg.slice(0, 120),
+      { type: "broadcast", fromId: String(adminId) }
+    );
     return res.json({ ok: true, sent });
   } catch (err) {
     console.error("Broadcast-all error:", err);
@@ -2462,7 +2431,26 @@ app.post("/coach-videos/:athleteId", requireAuth, requireCoach, async (req, res)
       ]
     );
     const row = result.rows[0];
-    const coachName = (await pool.query("SELECT name FROM users WHERE id=$1", [req.user.id])).rows[0]?.name || "Coach";
+    const coachName = (await pool.query("SELECT name FROM users WHERE id=$1", [req.user.id])).rows[0]?.name || "Your coach";
+
+    // Notify the athlete that new content was shared. The category may encode a
+    // content type as "type:youtube|pdf|link|realCategory" (broadcast content
+    // feature), so surface a friendly label for PDFs/links/videos.
+    const catRaw = String(row.category || "");
+    let kind = "a video";
+    if (catRaw.startsWith("type:")) {
+      const t = catRaw.split(":")[1];
+      if (t === "pdf") kind = "a PDF";
+      else if (t === "link") kind = "a link";
+      else kind = "a video";
+    }
+    sendPushToUser(
+      athleteId,
+      `${coachName} shared ${kind}`,
+      row.title,
+      { type: "coach-content", contentId: String(row.id) }
+    );
+
     return res.status(201).json({ ...row, coach_name: coachName });
   } catch (err) {
     console.error("Create coach video error:", err);
