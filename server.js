@@ -110,6 +110,12 @@ async function sendPushToUser(userId, title, body, data = {}) {
 
     const resp = await fcmMessaging.sendEachForMulticast(message);
     console.log(`[push] user ${userId}: sent — success ${resp.successCount}, failure ${resp.failureCount}`);
+    // Log the specific error for each failed token so delivery issues are visible.
+    resp.responses.forEach((r, i) => {
+      if (!r.success) {
+        console.log(`[push] user ${userId}: failure — code=${r.error?.code} msg=${r.error?.message}`);
+      }
+    });
 
     // Remove tokens that are permanently invalid so the table stays clean.
     if (resp.failureCount > 0) {
