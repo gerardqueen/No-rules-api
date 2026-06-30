@@ -995,7 +995,7 @@ app.get("/checkins/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async 
     const start = req.query.start ? String(req.query.start) : null;
     const end = req.query.end ? String(req.query.end) : null;
 
-    let q = `SELECT id, date::text AS date, title, link_url AS \"linkUrl\", notes, created_at
+    let q = `SELECT id, date::text AS date, time, title, link_url AS \"linkUrl\", notes, created_at
              FROM coach_checkins
              WHERE athlete_id = $1`;
     const params = [athleteId];
@@ -1017,27 +1017,29 @@ app.post("/checkins/:athleteId", requireAuth, requireCoach, async (req, res) => 
     const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
     if (!ok) return res.status(404).json({ error: "Athlete not found" });
 
-    const { date, title, linkUrl, notes } = req.body || {};
+    const { date, time, title, linkUrl, notes } = req.body || {};
     if (!date || typeof date !== "string") return res.status(400).json({ error: "date is required" });
 
     const t = String(title || "Check-in").slice(0, 120);
+    const tm = time ? String(time).slice(0, 10) : null;
     const l = linkUrl ? String(linkUrl).slice(0, 500) : null;
     const n = notes ? String(notes).slice(0, 2000) : null;
 
     const result = await pool.query(
-      `INSERT INTO coach_checkins (athlete_id, date, title, link_url, notes, created_by, created_at)
-       VALUES ($1, $2::date, $3, $4, $5, $6, NOW())
-       RETURNING id, date::text AS date, title, link_url AS \"linkUrl\", notes, created_at`,
-      [athleteId, date, t, l, n, req.user.id]
+      `INSERT INTO coach_checkins (athlete_id, date, time, title, link_url, notes, created_by, created_at)
+       VALUES ($1, $2::date, $3, $4, $5, $6, $7, NOW())
+       RETURNING id, date::text AS date, time, title, link_url AS \"linkUrl\", notes, created_at`,
+      [athleteId, date, tm, t, l, n, req.user.id]
     );
 
     const created = result.rows[0];
     // Notify the athlete that a check-in is due (fire-and-forget).
     const coachName = (await pool.query("SELECT name FROM users WHERE id=$1", [req.user.id])).rows[0]?.name || "Your coach";
+    const whenStr = created.time ? `${created.date} at ${created.time}` : created.date;
     sendPushToUser(
       athleteId,
-      "Check-in due",
-      `${coachName} scheduled a check-in: ${created.title}`,
+      "Check-in scheduled",
+      `${coachName} scheduled "${created.title}" for ${whenStr}`,
       { type: "checkin", checkinId: String(created.id) }
     );
 
@@ -2647,6 +2649,7 @@ app.listen(PORT, async () => {
         id BIGSERIAL PRIMARY KEY,
         athlete_id INTEGER NOT NULL,
         date DATE NOT NULL,
+        time TEXT,
         title TEXT NOT NULL,
         link_url TEXT,
         notes TEXT,
@@ -2654,6 +2657,8 @@ app.listen(PORT, async () => {
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
+    // Bring older schemas up to date (time added later).
+    try { await pool.query(`ALTER TABLE coach_checkins ADD COLUMN time TEXT`); } catch (_) {}
 
  await pool.query(`
  CREATE TABLE IF NOT EXISTS food_logs (
