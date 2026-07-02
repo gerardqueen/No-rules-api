@@ -101,6 +101,48 @@ async function sendPushToUsers(userIds, title, body, data = {}) {
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// EMAIL (Gmail SMTP via nodemailer)
+// Requires GMAIL_USER + GMAIL_APP_PASSWORD env vars (Google App Password, not
+// the normal account password). If unset the server boots fine and email is a
+// no-op — sendEmail returns { ok:false, reason:"disabled" }.
+// ─────────────────────────────────────────────────────────────────────────────
+let mailer = null;
+try {
+  if (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD) {
+    const nodemailer = require("nodemailer");
+    mailer = nodemailer.createTransport({
+      service: "gmail",
+      auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASSWORD },
+    });
+    console.log("Email enabled (Gmail).");
+  } else {
+    console.log("GMAIL_USER / GMAIL_APP_PASSWORD not set — email disabled.");
+  }
+} catch (e) {
+  console.error("Mailer init failed — email disabled:", e.message);
+  mailer = null;
+}
+
+async function sendEmail(to, subject, html) {
+  if (!mailer) return { ok: false, reason: "disabled" };
+  try {
+    await mailer.sendMail({ from: `No Rule Nutrition <${process.env.GMAIL_USER}>`, to, subject, html });
+    return { ok: true };
+  } catch (e) {
+    console.error("sendEmail error:", e.message);
+    return { ok: false, reason: e.message };
+  }
+}
+
+// Generate a readable-but-secure temporary password, e.g. "Kite7-Mango3-42".
+function generatePassword() {
+  const words = ["Kite","Mango","Tiger","River","Stone","Cedar","Falcon","Ember","Nova","Atlas","Orbit","Maple","Coral","Summit","Blaze","Frost"];
+  const w = () => words[Math.floor(Math.random() * words.length)] + Math.floor(Math.random() * 10);
+  return `${w()}-${w()}-${Math.floor(10 + Math.random() * 90)}`;
+}
+
+
 app.use(express.json());
 
 app.use(
@@ -425,6 +467,118 @@ app.post("/athletes", requireAuth, requireCoach, async (req, res) => {
   } catch (err) {
     console.error("Create athlete error:", err);
     return res.status(500).json({ error: "Could not create athlete" });
+  }
+});
+
+// Batch-create athletes from a CSV upload. Body: { athletes:[{name,email,sport}], sendEmails:bool }
+// Passwords are auto-generated per athlete. Returns per-row results including the
+// generated password so the coach can pass credentials on even if email fails.
+app.post("/athletes/batch", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { athletes, sendEmails } = req.body || {};
+    if (!Array.isArray(athletes) || athletes.length === 0) {
+      return res.status(400).json({ error: "No athletes provided" });
+    }
+    if (athletes.length > 200) {
+      return res.status(400).json({ error: "Maximum 200 athletes per upload" });
+    }
+
+    const results = [];
+    for (const row of athletes) {
+      const name = String(row?.name || "").trim();
+      const email = String(row?.email || "").toLowerCase().trim();
+      const sport = row?.sport ? String(row.sport).trim() : null;
+
+      if (!name || !email || !/^\S+@\S+\.\S+$/.test(email)) {
+        results.push({ name, email, status: "invalid", error: "Missing or invalid name/email" });
+        continue;
+      }
+      try {
+        const existing = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
+        if (existing.rows[0]) {
+          results.push({ name, email, status: "duplicate", error: "Email already exists" });
+          continue;
+        }
+        const password = generatePassword();
+        const passwordHash = await bcrypt.hash(password, 12);
+        await pool.query(
+          `INSERT INTO users (email, password_hash, name, role, sport, coach_id)
+           VALUES ($1, $2, $3, 'athlete', $4, $5)`,
+          [email, passwordHash, name, sport, req.user.id]
+        );
+
+        let emailed = false;
+        if (sendEmails) {
+          const html = `
+            <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto">
+              <h2 style="color:#FF9A52">Welcome to No Rule Nutrition</h2>
+              <p>Hi ${name},</p>
+              <p>Your coach has set up your account. Here are your login details:</p>
+              <div style="background:#f5f5f5;border-radius:8px;padding:14px 18px;margin:16px 0">
+                <p style="margin:4px 0"><b>Email:</b> ${email}</p>
+                <p style="margin:4px 0"><b>Temporary password:</b> ${password}</p>
+              </div>
+              <p>Download the app or log in at <a href="https://norulenutrition.uk">norulenutrition.uk</a>.</p>
+              <p style="color:#888;font-size:12px">We recommend changing your password after your first login.</p>
+            </div>`;
+          const sent = await sendEmail(email, "Your No Rule Nutrition login details", html);
+          emailed = sent.ok;
+        }
+        results.push({ name, email, status: "created", password, emailed });
+      } catch (rowErr) {
+        console.error("Batch row error:", rowErr.message);
+        results.push({ name, email, status: "error", error: "Could not create" });
+      }
+    }
+
+    const created = results.filter((r) => r.status === "created").length;
+    return res.json({ created, total: athletes.length, emailEnabled: !!mailer, results });
+  } catch (err) {
+    console.error("Batch create error:", err);
+    return res.status(500).json({ error: "Batch upload failed" });
+  }
+});
+
+// Resend login details / reset password. Generates a NEW password (the old one
+// is hashed and unrecoverable), updates the account, and emails it to the
+// athlete. Returns the new password so the coach can pass it on if email fails.
+app.post("/athletes/:athleteId/resend-credentials", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const athleteId = parseInt(req.params.athleteId, 10);
+    if (!Number.isFinite(athleteId)) return res.status(400).json({ error: "Invalid athlete id" });
+
+    const q = await pool.query(
+      "SELECT id, email, name, coach_id FROM users WHERE id = $1 AND role = 'athlete'",
+      [athleteId]
+    );
+    const athlete = q.rows[0];
+    if (!athlete) return res.status(404).json({ error: "Athlete not found" });
+    if (req.user.role !== "admin" && athlete.coach_id !== req.user.id) {
+      return res.status(403).json({ error: "Not your athlete" });
+    }
+
+    const password = generatePassword();
+    const passwordHash = await bcrypt.hash(password, 12);
+    await pool.query("UPDATE users SET password_hash = $1 WHERE id = $2", [passwordHash, athleteId]);
+
+    const html = `
+      <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto">
+        <h2 style="color:#FF9A52">Your new login details</h2>
+        <p>Hi ${athlete.name},</p>
+        <p>Your coach has reset your No Rule Nutrition password. Here are your new login details:</p>
+        <div style="background:#f5f5f5;border-radius:8px;padding:14px 18px;margin:16px 0">
+          <p style="margin:4px 0"><b>Email:</b> ${athlete.email}</p>
+          <p style="margin:4px 0"><b>New password:</b> ${password}</p>
+        </div>
+        <p>Log in via the app or at <a href="https://norulenutrition.uk">norulenutrition.uk</a>.</p>
+        <p style="color:#888;font-size:12px">Your previous password no longer works.</p>
+      </div>`;
+    const sent = await sendEmail(athlete.email, "Your new No Rule Nutrition login details", html);
+
+    return res.json({ ok: true, password, emailed: sent.ok, emailEnabled: !!mailer });
+  } catch (err) {
+    console.error("Resend credentials error:", err);
+    return res.status(500).json({ error: "Could not resend credentials" });
   }
 });
 
