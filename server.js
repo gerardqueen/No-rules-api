@@ -1204,6 +1204,105 @@ app.post("/checkins/:athleteId", requireAuth, requireCoach, async (req, res) => 
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// HABITS (Wellbeing) — coach sets habits per athlete; athlete RAG-rates daily.
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/habits/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const result = await pool.query(
+      `SELECT id, title, active, created_at FROM habits
+       WHERE athlete_id = $1 AND active = TRUE ORDER BY id ASC`,
+      [athleteId]
+    );
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("Get habits error:", err);
+    return res.status(500).json({ error: "Could not fetch habits" });
+  }
+});
+
+app.post("/habits/:athleteId", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+    const title = String(req.body?.title || "").trim().slice(0, 140);
+    if (!title) return res.status(400).json({ error: "title is required" });
+    const result = await pool.query(
+      `INSERT INTO habits (athlete_id, title, created_by) VALUES ($1, $2, $3)
+       RETURNING id, title, active, created_at`,
+      [athleteId, title, req.user.id]
+    );
+    return res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error("Create habit error:", err);
+    return res.status(500).json({ error: "Could not create habit" });
+  }
+});
+
+app.delete("/habits/:athleteId/:id", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+    // Soft-delete so historical ratings keep their context.
+    await pool.query(`UPDATE habits SET active = FALSE WHERE athlete_id = $1 AND id = $2`, [
+      athleteId, Number(req.params.id),
+    ]);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Delete habit error:", err);
+    return res.status(500).json({ error: "Could not delete habit" });
+  }
+});
+
+// Ratings for a date range: returns [{habit_id, date, rating}]
+app.get("/habit-ratings/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const start = req.query.start ? String(req.query.start) : null;
+    const end = req.query.end ? String(req.query.end) : null;
+    let q = `SELECT habit_id, date::text AS date, rating FROM habit_ratings WHERE athlete_id = $1`;
+    const params = [athleteId];
+    if (start) { params.push(start); q += ` AND date >= $${params.length}::date`; }
+    if (end) { params.push(end); q += ` AND date <= $${params.length}::date`; }
+    q += ` ORDER BY date ASC`;
+    const result = await pool.query(q, params);
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("Get habit ratings error:", err);
+    return res.status(500).json({ error: "Could not fetch habit ratings" });
+  }
+});
+
+// Athlete rates a habit for a date. Body: { habitId, date, rating: 'R'|'A'|'G' }
+app.put("/habit-ratings/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const habitId = Number(req.body?.habitId);
+    const date = String(req.body?.date || "");
+    const rating = String(req.body?.rating || "").toUpperCase();
+    if (!habitId || !date || !["R", "A", "G"].includes(rating)) {
+      return res.status(400).json({ error: "habitId, date and rating (R/A/G) required" });
+    }
+    // Confirm the habit belongs to this athlete.
+    const h = await pool.query(`SELECT id FROM habits WHERE id = $1 AND athlete_id = $2`, [habitId, athleteId]);
+    if (!h.rows[0]) return res.status(404).json({ error: "Habit not found" });
+    await pool.query(
+      `INSERT INTO habit_ratings (habit_id, athlete_id, date, rating, updated_at)
+       VALUES ($1, $2, $3::date, $4, NOW())
+       ON CONFLICT (habit_id, date)
+       DO UPDATE SET rating = EXCLUDED.rating, updated_at = NOW()`,
+      [habitId, athleteId, date, rating]
+    );
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Rate habit error:", err);
+    return res.status(500).json({ error: "Could not save rating" });
+  }
+});
+
 app.delete("/checkins/:athleteId/:id", requireAuth, requireCoach, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
@@ -2813,6 +2912,29 @@ app.listen(PORT, async () => {
     `);
     // Bring older schemas up to date (time added later).
     try { await pool.query(`ALTER TABLE coach_checkins ADD COLUMN time TEXT`); } catch (_) {}
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS habits (
+        id BIGSERIAL PRIMARY KEY,
+        athlete_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        active BOOLEAN DEFAULT TRUE,
+        created_by INTEGER,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS habit_ratings (
+        id BIGSERIAL PRIMARY KEY,
+        habit_id BIGINT NOT NULL,
+        athlete_id INTEGER NOT NULL,
+        date DATE NOT NULL,
+        rating TEXT NOT NULL CHECK (rating IN ('R','A','G')),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE (habit_id, date)
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_habit_ratings_athlete_date ON habit_ratings (athlete_id, date);`);
 
  await pool.query(`
  CREATE TABLE IF NOT EXISTS food_logs (
