@@ -1205,6 +1205,123 @@ app.post("/checkins/:athleteId", requireAuth, requireCoach, async (req, res) => 
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PLANNED MEALS — coach plans meals per date (up to a month ahead), athlete
+// views them and can add them to their own log. Separate from food_logs
+// (what was actually eaten).
+// Shape: meals = { Breakfast:[items], Lunch:[], Dinner:[], Snack:[] }
+// item  = { name, grams, calories, protein_g, carbs_g, fat_g }
+// ─────────────────────────────────────────────────────────────────────────────
+const MEAL_SLOTS = ["Breakfast", "Lunch", "Dinner", "Snack"];
+
+function sanitizeMeals(meals) {
+  const out = {};
+  for (const slot of MEAL_SLOTS) {
+    const items = Array.isArray(meals?.[slot]) ? meals[slot] : [];
+    out[slot] = items.slice(0, 40).map((i) => ({
+      name: String(i?.name || "").slice(0, 140),
+      grams: Number(i?.grams || 0) || null,
+      calories: Math.round(Number(i?.calories || 0)),
+      protein_g: Math.round((Number(i?.protein_g ?? i?.protein ?? 0)) * 10) / 10,
+      carbs_g: Math.round((Number(i?.carbs_g ?? i?.carbs ?? 0)) * 10) / 10,
+      fat_g: Math.round((Number(i?.fat_g ?? i?.fat ?? 0)) * 10) / 10,
+    })).filter((i) => i.name);
+  }
+  return out;
+}
+
+app.get("/planned-meals/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const start = req.query.start ? String(req.query.start) : null;
+    const end = req.query.end ? String(req.query.end) : null;
+    let q = `SELECT date::text AS date, meals, updated_at FROM planned_meals WHERE athlete_id = $1`;
+    const params = [athleteId];
+    if (start) { params.push(start); q += ` AND date >= $${params.length}::date`; }
+    if (end) { params.push(end); q += ` AND date <= $${params.length}::date`; }
+    q += ` ORDER BY date ASC`;
+    const result = await pool.query(q, params);
+    return res.json(result.rows.map((r) => ({ ...r, meals: r.meals || {} })));
+  } catch (err) {
+    console.error("Get planned meals error:", err);
+    return res.status(500).json({ error: "Could not fetch planned meals" });
+  }
+});
+
+app.put("/planned-meals/:athleteId", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+    const date = String(req.body?.date || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: "date (YYYY-MM-DD) required" });
+    const meals = sanitizeMeals(req.body?.meals);
+    await pool.query(
+      `INSERT INTO planned_meals (athlete_id, date, meals, updated_by, updated_at)
+       VALUES ($1, $2::date, $3::jsonb, $4, NOW())
+       ON CONFLICT (athlete_id, date)
+       DO UPDATE SET meals = EXCLUDED.meals, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+      [athleteId, date, JSON.stringify(meals), req.user.id]
+    );
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Save planned meals error:", err);
+    return res.status(500).json({ error: "Could not save planned meals" });
+  }
+});
+
+// Batch copy: copy one date's plan to many target dates (max 62 — two months).
+app.post("/planned-meals/:athleteId/copy", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+    const fromDate = String(req.body?.fromDate || "");
+    const toDates = Array.isArray(req.body?.toDates) ? req.body.toDates.slice(0, 62) : [];
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fromDate) || toDates.length === 0) {
+      return res.status(400).json({ error: "fromDate and toDates[] required" });
+    }
+    const src = await pool.query(
+      `SELECT meals FROM planned_meals WHERE athlete_id = $1 AND date = $2::date`,
+      [athleteId, fromDate]
+    );
+    if (!src.rows[0]) return res.status(404).json({ error: "Nothing planned on the source date" });
+    const meals = JSON.stringify(src.rows[0].meals || {});
+    let copied = 0;
+    for (const d of toDates) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(d)) || d === fromDate) continue;
+      await pool.query(
+        `INSERT INTO planned_meals (athlete_id, date, meals, updated_by, updated_at)
+         VALUES ($1, $2::date, $3::jsonb, $4, NOW())
+         ON CONFLICT (athlete_id, date)
+         DO UPDATE SET meals = EXCLUDED.meals, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+        [athleteId, d, meals, req.user.id]
+      );
+      copied++;
+    }
+    return res.json({ ok: true, copied });
+  } catch (err) {
+    console.error("Copy planned meals error:", err);
+    return res.status(500).json({ error: "Could not copy planned meals" });
+  }
+});
+
+app.delete("/planned-meals/:athleteId/:date", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+    await pool.query(
+      `DELETE FROM planned_meals WHERE athlete_id = $1 AND date = $2::date`,
+      [athleteId, String(req.params.date)]
+    );
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Delete planned meals error:", err);
+    return res.status(500).json({ error: "Could not clear planned meals" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // HABITS (Wellbeing) — coach sets habits per athlete; athlete RAG-rates daily.
 // ─────────────────────────────────────────────────────────────────────────────
 app.get("/habits/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
@@ -2935,6 +3052,18 @@ app.listen(PORT, async () => {
       );
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_habit_ratings_athlete_date ON habit_ratings (athlete_id, date);`);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS planned_meals (
+        id BIGSERIAL PRIMARY KEY,
+        athlete_id INTEGER NOT NULL,
+        date DATE NOT NULL,
+        meals JSONB NOT NULL DEFAULT '{}',
+        updated_by INTEGER,
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE (athlete_id, date)
+      );
+    `);
 
  await pool.query(`
  CREATE TABLE IF NOT EXISTS food_logs (
