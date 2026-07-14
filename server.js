@@ -212,6 +212,10 @@ app.post("/auth/login", async (req, res) => {
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ error: "Incorrect email or password" });
 
+    if (user.active === false) {
+      return res.status(403).json({ error: "This account is paused. Contact your coach to reactivate it." });
+    }
+
     const token = jwt.sign(
       { id: user.id, email: user.email, role: user.role, name: user.name },
       process.env.JWT_SECRET,
@@ -408,7 +412,7 @@ async function requireSelfOrCoachOfAthlete(req, res, next) {
 app.get("/athletes", requireAuth, requireCoach, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, email, name, role, sport, mfp_username, avatar_url, created_at
+      `SELECT id, email, name, role, sport, mfp_username, avatar_url, active, created_at
        FROM users
        WHERE coach_id = $1 AND role NOT IN ('coach','admin')
        ORDER BY name ASC`,
@@ -673,6 +677,68 @@ app.post("/athletes/:athleteId/resend-credentials", requireAuth, requireCoach, a
   }
 });
 
+// List coaches (for transferring athletes between coaches).
+app.get("/coaches", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, name, email FROM users WHERE role IN ('coach','admin') ORDER BY name ASC`
+    );
+    return res.json(r.rows);
+  } catch (err) {
+    console.error("List coaches error:", err);
+    return res.status(500).json({ error: "Could not list coaches" });
+  }
+});
+
+// Pause / unpause an athlete account. Paused athletes cannot log in; all their
+// data is kept exactly as-is. Pausing also drops device tokens so pushes stop.
+app.patch("/athletes/:athleteId/status", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+    const active = !!req.body?.active;
+    await pool.query(
+      "UPDATE users SET active = $1 WHERE id = $2 AND role NOT IN ('coach','admin')",
+      [active, athleteId]
+    );
+    if (!active) {
+      await pool.query("DELETE FROM device_tokens WHERE user_id = $1", [athleteId]).catch(() => {});
+    }
+    return res.json({ ok: true, active });
+  } catch (err) {
+    console.error("Set athlete status error:", err);
+    return res.status(500).json({ error: "Could not update account status" });
+  }
+});
+
+// Transfer an athlete to another coach. Everything keyed to the athlete —
+// food logs, weights, moods, habits + ratings, planned meals, calendar events,
+// check-ins, macro plans/targets, shopping list, saved meals — stays in place
+// automatically because it is keyed by athlete_id, not coach_id.
+app.post("/athletes/:athleteId/transfer", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+    const newCoachId = Number(req.body?.newCoachId);
+    if (!newCoachId) return res.status(400).json({ error: "newCoachId required" });
+    const c = await pool.query(
+      "SELECT id, name FROM users WHERE id = $1 AND role IN ('coach','admin')",
+      [newCoachId]
+    );
+    if (!c.rows[0]) return res.status(400).json({ error: "Target coach not found" });
+    await pool.query(
+      "UPDATE users SET coach_id = $1 WHERE id = $2 AND role NOT IN ('coach','admin')",
+      [newCoachId, athleteId]
+    );
+    return res.json({ ok: true, newCoach: c.rows[0] });
+  } catch (err) {
+    console.error("Transfer athlete error:", err);
+    return res.status(500).json({ error: "Could not transfer athlete" });
+  }
+});
+
 app.delete("/athletes/:athleteId", requireAuth, requireCoach, async (req, res) => {
   const athleteId = Number(req.params.athleteId);
   if (!Number.isInteger(athleteId) || athleteId <= 0) return res.status(400).json({ error: "Invalid athlete id" });
@@ -684,6 +750,9 @@ app.delete("/athletes/:athleteId", requireAuth, requireCoach, async (req, res) =
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      // Full data removal — every table keyed to this athlete. Shared
+      // custom_foods contributions are intentionally kept (they are communal
+      // product data, not personal data).
       await client.query('DELETE FROM coach_checkins WHERE athlete_id = $1', [athleteId]);
       await client.query('DELETE FROM daily_totals WHERE athlete_id = $1', [athleteId]);
       await client.query('DELETE FROM macro_targets WHERE athlete_id = $1', [athleteId]);
@@ -692,7 +761,22 @@ app.delete("/athletes/:athleteId", requireAuth, requireCoach, async (req, res) =
       await client.query('DELETE FROM meal_plans WHERE athlete_id = $1', [athleteId]);
       await client.query('DELETE FROM profiles WHERE athlete_id = $1', [athleteId]);
       await client.query('DELETE FROM macro_plans WHERE athlete_id = $1', [athleteId]);
-      await client.query("DELETE FROM users WHERE id = $1 AND coach_id = $2 AND role NOT IN ('coach','admin')", [athleteId, req.user.id]);
+      await client.query('DELETE FROM food_logs WHERE athlete_id = $1', [athleteId]);
+      await client.query('DELETE FROM habit_ratings WHERE athlete_id = $1', [athleteId]);
+      await client.query('DELETE FROM habits WHERE athlete_id = $1', [athleteId]);
+      await client.query('DELETE FROM planned_meals WHERE athlete_id = $1', [athleteId]);
+      await client.query('DELETE FROM calendar_events WHERE athlete_id = $1', [athleteId]);
+      await client.query('DELETE FROM shopping_list WHERE athlete_id = $1', [athleteId]);
+      await client.query('DELETE FROM custom_meals WHERE athlete_id = $1', [athleteId]);
+      await client.query('DELETE FROM coach_videos WHERE athlete_id = $1', [athleteId]);
+      await client.query('DELETE FROM device_tokens WHERE user_id = $1', [athleteId]).catch(() => {});
+      await client.query('DELETE FROM password_resets WHERE user_id = $1', [athleteId]);
+      try { await client.query('DELETE FROM messages WHERE from_id = $1 OR to_id = $1', [athleteId]); } catch (_) {}
+      if (req.user.role === 'admin') {
+        await client.query("DELETE FROM users WHERE id = $1 AND role NOT IN ('coach','admin')", [athleteId]);
+      } else {
+        await client.query("DELETE FROM users WHERE id = $1 AND coach_id = $2 AND role NOT IN ('coach','admin')", [athleteId, req.user.id]);
+      }
       await client.query('COMMIT');
       return res.json({ ok: true });
     } catch (err) {
@@ -3120,6 +3204,7 @@ app.listen(PORT, async () => {
     `);
     // Bring older schemas up to date (time added later).
     try { await pool.query(`ALTER TABLE coach_checkins ADD COLUMN time TEXT`); } catch (_) {}
+    try { await pool.query(`ALTER TABLE users ADD COLUMN active BOOLEAN DEFAULT TRUE`); } catch (_) {}
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS habits (
