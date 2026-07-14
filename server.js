@@ -237,6 +237,97 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PASSWORD RESET (self-serve) — emails a 6-digit code, valid for 15 minutes.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/auth/forgot-password", async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").toLowerCase().trim();
+    // Always respond generically so the endpoint can't be used to test which
+    // emails have accounts.
+    const generic = { ok: true, message: "If that email has an account, a reset code has been sent." };
+    if (!email || !/^\S+@\S+\.\S+$/.test(email)) return res.json(generic);
+    if (!mailer) return res.status(503).json({ error: "Password reset by email isn't available right now. Please contact your coach to reset your login." });
+
+    const u = await pool.query("SELECT id, name FROM users WHERE email = $1", [email]);
+    const user = u.rows[0];
+    if (!user) return res.json(generic);
+
+    // Light rate limit: one code per 60 seconds per account.
+    const recent = await pool.query(
+      "SELECT 1 FROM password_resets WHERE user_id = $1 AND created_at > NOW() - INTERVAL '60 seconds'",
+      [user.id]
+    );
+    if (recent.rows[0]) return res.json(generic);
+
+    const code = String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
+    const codeHash = await bcrypt.hash(code, 10);
+    // Invalidate any previous codes, then store the new one.
+    await pool.query("UPDATE password_resets SET used = TRUE WHERE user_id = $1 AND used = FALSE", [user.id]);
+    await pool.query(
+      "INSERT INTO password_resets (user_id, code_hash, expires_at) VALUES ($1, $2, NOW() + INTERVAL '15 minutes')",
+      [user.id, codeHash]
+    );
+
+    const html = `
+      <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto">
+        <h2 style="color:#FF9A52">Password reset code</h2>
+        <p>Hi ${user.name || ""},</p>
+        <p>Use this code in the app to set a new password. It expires in 15 minutes.</p>
+        <div style="background:#f5f5f5;border-radius:8px;padding:16px;text-align:center;margin:16px 0">
+          <span style="font-size:30px;letter-spacing:8px;font-weight:bold">${code}</span>
+        </div>
+        <p style="color:#888;font-size:12px">If you didn't request this, you can ignore this email — your password is unchanged.</p>
+      </div>`;
+    sendEmail(email, "Your No Rule Nutrition reset code", html); // fire-and-forget
+
+    return res.json(generic);
+  } catch (err) {
+    console.error("Forgot password error:", err);
+    return res.status(500).json({ error: "Could not process the request" });
+  }
+});
+
+app.post("/auth/reset-password", async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").toLowerCase().trim();
+    const code = String(req.body?.code || "").replace(/\D/g, "");
+    const newPassword = String(req.body?.newPassword || "");
+    if (!email || code.length !== 6) return res.status(400).json({ error: "Email and 6-digit code required" });
+    if (newPassword.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
+
+    const u = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
+    const user = u.rows[0];
+    if (!user) return res.status(400).json({ error: "Invalid code" });
+
+    const pr = await pool.query(
+      `SELECT id, code_hash, attempts FROM password_resets
+       WHERE user_id = $1 AND used = FALSE AND expires_at > NOW()
+       ORDER BY created_at DESC LIMIT 1`,
+      [user.id]
+    );
+    const row = pr.rows[0];
+    if (!row) return res.status(400).json({ error: "Code expired or not found — request a new one" });
+    if (row.attempts >= 5) return res.status(429).json({ error: "Too many attempts — request a new code" });
+
+    const match = await bcrypt.compare(code, row.code_hash);
+    if (!match) {
+      await pool.query("UPDATE password_resets SET attempts = attempts + 1 WHERE id = $1", [row.id]);
+      return res.status(400).json({ error: "Invalid code" });
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+    await pool.query("UPDATE users SET password_hash = $1 WHERE id = $2", [passwordHash, user.id]);
+    await pool.query("UPDATE password_resets SET used = TRUE WHERE id = $1", [row.id]);
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Reset password error:", err);
+    return res.status(500).json({ error: "Could not reset the password" });
+  }
+});
+
+
 app.get("/auth/me", requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
@@ -3052,6 +3143,18 @@ app.listen(PORT, async () => {
       );
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_habit_ratings_athlete_date ON habit_ratings (athlete_id, date);`);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS password_resets (
+        id BIGSERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        code_hash TEXT NOT NULL,
+        attempts INTEGER DEFAULT 0,
+        used BOOLEAN DEFAULT FALSE,
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS planned_meals (
