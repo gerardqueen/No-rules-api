@@ -2042,7 +2042,11 @@ app.post("/messages/broadcast", requireAuth, requireCoach, async (req, res) => {
     let sent = 0;
     for (const a of athletes.rows) {
       await pool.query(
-        `INSERT INTO messages (from_id, to_id, content, message_type, created_at) VALUES ($1,$2,$3,'broadcast',NOW())`,
+        `WITH ins AS (
+           INSERT INTO messages (from_id, to_id, content, message_type, subject, created_at)
+           VALUES ($1,$2,$3,'broadcast','📢 Announcement',NOW())
+           RETURNING id
+         ) UPDATE messages SET thread_id = ins.id FROM ins WHERE messages.id = ins.id`,
         [coachId, a.id, msg]
       );
       sent++;
@@ -2078,7 +2082,11 @@ app.post("/messages/broadcast-all", requireAuth, requireAdmin, async (req, res) 
     let sent = 0;
     for (const a of athletes.rows) {
       await pool.query(
-        `INSERT INTO messages (from_id, to_id, content, message_type, created_at) VALUES ($1,$2,$3,'broadcast',NOW())`,
+        `WITH ins AS (
+           INSERT INTO messages (from_id, to_id, content, message_type, subject, created_at)
+           VALUES ($1,$2,$3,'broadcast','📢 Announcement',NOW())
+           RETURNING id
+         ) UPDATE messages SET thread_id = ins.id FROM ins WHERE messages.id = ins.id`,
         [adminId, a.id, msg]
       );
       sent++;
@@ -2227,6 +2235,37 @@ app.get("/messages/threads/:otherId", requireAuth, async (req, res) => {
   }
 });
 
+// React to a message with an emoji. One reaction per user per message:
+// sending a new emoji replaces the old one; sending emoji: null removes it.
+app.put("/messages/:messageId/reaction", requireAuth, async (req, res) => {
+  try {
+    const messageId = Number(req.params.messageId);
+    if (!Number.isInteger(messageId)) return res.status(400).json({ error: "Invalid message id" });
+    const me = req.user.id;
+    // Only the two participants of a message can react to it.
+    const m = await pool.query("SELECT from_id, to_id FROM messages WHERE id = $1", [messageId]);
+    const row = m.rows[0];
+    if (!row || (row.from_id !== me && row.to_id !== me)) {
+      return res.status(404).json({ error: "Message not found" });
+    }
+    const emoji = req.body?.emoji ? String(req.body.emoji).slice(0, 8) : null;
+    if (!emoji) {
+      await pool.query("DELETE FROM message_reactions WHERE message_id = $1 AND user_id = $2", [messageId, me]);
+      return res.json({ ok: true, removed: true });
+    }
+    await pool.query(
+      `INSERT INTO message_reactions (message_id, user_id, emoji)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (message_id, user_id) DO UPDATE SET emoji = EXCLUDED.emoji, created_at = NOW()`,
+      [messageId, me, emoji]
+    );
+    return res.json({ ok: true, emoji });
+  } catch (err) {
+    console.error("React to message error:", err);
+    return res.status(500).json({ error: "Could not save reaction" });
+  }
+});
+
 app.get("/messages/thread/:otherId/:threadId", requireAuth, async (req, res) => {
   try {
     await ensureMessagesTable();
@@ -2270,7 +2309,23 @@ app.get("/messages/thread/:otherId/:threadId", requireAuth, async (req, res) => 
         await pool.query(`UPDATE messages SET is_read = TRUE WHERE id = $1 AND to_id = $2 AND is_read = FALSE`, [-threadId, me]);
       }
     } catch {}
-    return res.json(result.rows.map(r => ({ ...r, fromName: r.fromName || "Unknown" })));
+
+    // Attach reactions to each message.
+    let reactionsByMsg = {};
+    try {
+      const ids = result.rows.map((r) => r.id);
+      if (ids.length) {
+        const rx = await pool.query(
+          `SELECT message_id, user_id, emoji FROM message_reactions WHERE message_id = ANY($1::bigint[])`,
+          [ids]
+        );
+        rx.rows.forEach((r) => {
+          (reactionsByMsg[r.message_id] = reactionsByMsg[r.message_id] || []).push({ userId: r.user_id, emoji: r.emoji });
+        });
+      }
+    } catch {}
+
+    return res.json(result.rows.map(r => ({ ...r, fromName: r.fromName || "Unknown", reactions: reactionsByMsg[r.id] || [] })));
   } catch (err) {
     console.error("Thread fetch error:", err);
     return res.status(500).json({ error: "Could not fetch thread" });
@@ -2299,10 +2354,25 @@ app.get("/messages/:otherId", requireAuth, async (req, res) => {
     }
     sql += ` ORDER BY m.created_at ASC`;
     const result = await pool.query(sql, params);
+    // Attach reactions
+    let reactionsByMsg = {};
+    try {
+      const ids = result.rows.map((r) => r.id);
+      if (ids.length) {
+        const rx = await pool.query(
+          `SELECT message_id, user_id, emoji FROM message_reactions WHERE message_id = ANY($1::bigint[])`,
+          [ids]
+        );
+        rx.rows.forEach((r) => {
+          (reactionsByMsg[r.message_id] = reactionsByMsg[r.message_id] || []).push({ userId: r.user_id, emoji: r.emoji });
+        });
+      }
+    } catch {}
     const rows = result.rows.map(r => ({
       ...r,
       fromName: r.fromName || "Unknown",
       messageType: r.messageType || "chat",
+      reactions: reactionsByMsg[r.id] || [],
     }));
     try { await pool.query(`UPDATE messages SET is_read=TRUE WHERE from_id=$1 AND to_id=$2 AND is_read=FALSE`, [other, me]); }
     catch { try { await pool.query(`UPDATE messages SET "read"=TRUE WHERE from_id=$1 AND to_id=$2 AND "read"=FALSE`, [other, me]); } catch {} }
@@ -3331,6 +3401,17 @@ app.listen(PORT, async () => {
       );
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_habit_ratings_athlete_date ON habit_ratings (athlete_id, date);`);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS message_reactions (
+        id BIGSERIAL PRIMARY KEY,
+        message_id BIGINT NOT NULL,
+        user_id INTEGER NOT NULL,
+        emoji TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE (message_id, user_id)
+      );
+    `);
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS password_resets (
