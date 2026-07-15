@@ -124,15 +124,67 @@ try {
   mailer = null;
 }
 
-async function sendEmail(to, subject, html) {
+async function sendEmail(to, subject, html, extra = {}) {
   if (!mailer) return { ok: false, reason: "disabled" };
   try {
-    await mailer.sendMail({ from: `No Rule Nutrition <${process.env.GMAIL_USER}>`, to, subject, html });
+    await mailer.sendMail({ from: `No Rule Nutrition <${process.env.GMAIL_USER}>`, to, subject, html, ...extra });
     return { ok: true };
   } catch (e) {
     console.error("sendEmail error:", e.message);
     return { ok: false, reason: e.message };
   }
+}
+
+// Build an iCalendar invite for a coach check-in. Sent via nodemailer's
+// icalEvent so Gmail/Outlook render a proper "Add to calendar" invite.
+function buildCheckinIcs({ id, title, date, time, notes, linkUrl, organizerName }) {
+  const dt = String(date).replace(/-/g, "");
+  let dtStart, dtEnd, allDay = false;
+  if (time) {
+    const hhmm = String(time).replace(":", "").slice(0, 4).padEnd(4, "0");
+    let h = parseInt(hhmm.slice(0, 2), 10);
+    let m = parseInt(hhmm.slice(2, 4), 10) + 30; // default 30-min slot
+    if (m >= 60) { m -= 60; h = (h + 1) % 24; }
+    dtStart = `${dt}T${hhmm}00`;
+    dtEnd = `${dt}T${String(h).padStart(2, "0")}${String(m).padStart(2, "0")}00`;
+  } else {
+    allDay = true;
+    dtStart = dt;
+    dtEnd = dt;
+  }
+  const esc = (x) => String(x || "").replace(/([,;\\])/g, "\\$1").replace(/\r?\n/g, "\\n");
+  const desc = [notes, linkUrl ? `Join: ${linkUrl}` : ""].filter(Boolean).join("\n\n");
+  return [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//No Rule Nutrition//Check-in//EN",
+    "METHOD:REQUEST",
+    "BEGIN:VEVENT",
+    `UID:nrn-checkin-${id}@norulenutrition.uk`,
+    `DTSTAMP:${new Date().toISOString().replace(/[-:]/g, "").slice(0, 15)}Z`,
+    allDay ? `DTSTART;VALUE=DATE:${dtStart}` : `DTSTART:${dtStart}`,
+    allDay ? `DTEND;VALUE=DATE:${dtEnd}` : `DTEND:${dtEnd}`,
+    `SUMMARY:${esc(title || "Coach check-in")}`,
+    desc ? `DESCRIPTION:${esc(desc)}` : "",
+    linkUrl ? `LOCATION:${esc(linkUrl)}` : "",
+    `ORGANIZER;CN=${esc(organizerName || "No Rule Nutrition")}:mailto:${process.env.GMAIL_USER || "noreply@norulenutrition.uk"}`,
+    "STATUS:CONFIRMED",
+    "END:VEVENT",
+    "END:VCALENDAR",
+  ].filter(Boolean).join("\r\n");
+}
+
+// Light throttle for chat-message emails so busy threads don't flood inboxes:
+// at most one email per sender->recipient pair every 15 minutes. In-memory is
+// fine — worst case after a redeploy is one extra email.
+const _lastMsgEmail = new Map();
+function shouldEmailMessage(fromId, toId) {
+  const key = `${fromId}>${toId}`;
+  const now = Date.now();
+  const last = _lastMsgEmail.get(key) || 0;
+  if (now - last < 15 * 60 * 1000) return false;
+  _lastMsgEmail.set(key, now);
+  return true;
 }
 
 // Generate a readable-but-secure temporary password, e.g. "Kite7-Mango3-42".
@@ -1372,6 +1424,37 @@ app.post("/checkins/:athleteId", requireAuth, requireCoach, async (req, res) => 
       { type: "checkin", checkinId: String(created.id) }
     );
 
+    // Email reminder with a real calendar invite (fire-and-forget).
+    (async () => {
+      try {
+        const au = await pool.query("SELECT email, name FROM users WHERE id = $1", [athleteId]);
+        const athlete = au.rows[0];
+        if (!athlete?.email) return;
+        const ukDate = String(created.date).split("-").reverse().join("/");
+        const html = `
+          <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto">
+            <h2 style="color:#FF9A52">Check-in scheduled</h2>
+            <p>Hi ${athlete.name || ""},</p>
+            <p>${coachName} has scheduled <b>${created.title}</b> for <b>${ukDate}${created.time ? ` at ${created.time}` : ""}</b>.</p>
+            ${created.notes ? `<div style="background:#f5f5f5;border-radius:8px;padding:12px 16px;margin:14px 0;white-space:pre-wrap">${String(created.notes)}</div>` : ""}
+            ${created.linkUrl ? `<p style="margin:18px 0"><a href="${created.linkUrl}" style="background:#22c55e;color:#06210f;text-decoration:none;padding:12px 22px;border-radius:8px;font-weight:bold">📹 Join Google Meet</a></p>` : ""}
+            <p style="color:#888;font-size:12px">The attached invite adds this to your calendar automatically.</p>
+          </div>`;
+        const ics = buildCheckinIcs({
+          id: created.id,
+          title: created.title,
+          date: created.date,
+          time: created.time,
+          notes: created.notes,
+          linkUrl: created.linkUrl,
+          organizerName: coachName,
+        });
+        sendEmail(athlete.email, `Check-in: ${created.title} — ${ukDate}${created.time ? ` ${created.time}` : ""}`, html, {
+          icalEvent: { filename: "checkin.ics", method: "REQUEST", content: ics },
+        });
+      } catch (e) { console.error("Check-in email error:", e.message); }
+    })();
+
     return res.json(created);
   } catch (err) {
     console.error("Create checkin error:", err);
@@ -2269,6 +2352,26 @@ app.post("/messages/:toId", requireAuth, async (req, res) => {
       preview,
       { type: "message", fromId: String(fromId), threadId: String(row.threadId || row.id) }
     );
+
+    // Email copy of the message (fire-and-forget, throttled to one email per
+    // sender→recipient pair every 15 minutes so busy threads don't flood inboxes).
+    if (shouldEmailMessage(fromId, toId)) {
+      (async () => {
+        try {
+          const ru = await pool.query("SELECT email, name FROM users WHERE id = $1", [toId]);
+          const recipient = ru.rows[0];
+          if (!recipient?.email) return;
+          const html = `
+            <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto">
+              <h2 style="color:#FF9A52">New message from ${fromName}</h2>
+              ${cleanSubject ? `<p style="font-weight:bold">${cleanSubject}</p>` : ""}
+              <div style="background:#f5f5f5;border-radius:8px;padding:14px 18px;margin:14px 0;white-space:pre-wrap">${content.trim().slice(0, 2000)}</div>
+              <p style="color:#888;font-size:12px">Open the No Rule Nutrition app to reply. If more messages follow shortly, they won't each send a separate email.</p>
+            </div>`;
+          sendEmail(recipient.email, cleanSubject ? `${fromName}: ${cleanSubject}` : `New message from ${fromName}`, html);
+        } catch (e) { console.error("Message email error:", e.message); }
+      })();
+    }
 
     return res.json({ ...row, fromName });
   } catch (err) {
