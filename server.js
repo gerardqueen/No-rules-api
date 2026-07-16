@@ -2235,6 +2235,28 @@ app.get("/messages/threads/:otherId", requireAuth, async (req, res) => {
   }
 });
 
+// Delete a message. Only the SENDER can delete, and it is removed for both
+// sides (hard delete, reactions included).
+app.delete("/messages/:messageId", requireAuth, async (req, res) => {
+  try {
+    const messageId = Number(req.params.messageId);
+    if (!Number.isInteger(messageId)) return res.status(400).json({ error: "Invalid message id" });
+    const me = req.user.id;
+    const m = await pool.query("SELECT from_id FROM messages WHERE id = $1", [messageId]);
+    const row = m.rows[0];
+    if (!row) return res.status(404).json({ error: "Message not found" });
+    if (Number(row.from_id) !== Number(me)) {
+      return res.status(403).json({ error: "You can only delete messages you sent" });
+    }
+    await pool.query("DELETE FROM message_reactions WHERE message_id = $1", [messageId]).catch(() => {});
+    await pool.query("DELETE FROM messages WHERE id = $1", [messageId]);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Delete message error:", err);
+    return res.status(500).json({ error: "Could not delete message" });
+  }
+});
+
 // React to a message with an emoji. One reaction per user per message:
 // sending a new emoji replaces the old one; sending emoji: null removes it.
 app.put("/messages/:messageId/reaction", requireAuth, async (req, res) => {
