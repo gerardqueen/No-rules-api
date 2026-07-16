@@ -2235,6 +2235,42 @@ app.get("/messages/threads/:otherId", requireAuth, async (req, res) => {
   }
 });
 
+// Delete an entire thread for both sides. Either participant can do this.
+// threadId > 0 = real thread; negative = legacy single-message thread.
+app.delete("/messages/threads/:otherId/:threadId", requireAuth, async (req, res) => {
+  try {
+    const me = req.user.id;
+    const other = Number(req.params.otherId);
+    const threadId = Number(req.params.threadId);
+    if (!Number.isInteger(other) || !Number.isInteger(threadId)) {
+      return res.status(400).json({ error: "Invalid ids" });
+    }
+    let ids = [];
+    if (threadId > 0) {
+      const r = await pool.query(
+        `SELECT id FROM messages WHERE thread_id = $1
+           AND ((from_id = $2 AND to_id = $3) OR (from_id = $3 AND to_id = $2))`,
+        [threadId, me, other]
+      );
+      ids = r.rows.map((x) => x.id);
+    } else {
+      const r = await pool.query(
+        `SELECT id FROM messages WHERE id = $1
+           AND ((from_id = $2 AND to_id = $3) OR (from_id = $3 AND to_id = $2))`,
+        [-threadId, me, other]
+      );
+      ids = r.rows.map((x) => x.id);
+    }
+    if (!ids.length) return res.status(404).json({ error: "Thread not found" });
+    await pool.query("DELETE FROM message_reactions WHERE message_id = ANY($1::bigint[])", [ids]).catch(() => {});
+    await pool.query("DELETE FROM messages WHERE id = ANY($1::bigint[])", [ids]);
+    return res.json({ ok: true, deleted: ids.length });
+  } catch (err) {
+    console.error("Delete thread error:", err);
+    return res.status(500).json({ error: "Could not delete thread" });
+  }
+});
+
 // Delete a message. Only the SENDER can delete, and it is removed for both
 // sides (hard delete, reactions included).
 app.delete("/messages/:messageId", requireAuth, async (req, res) => {
