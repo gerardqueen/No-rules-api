@@ -1635,6 +1635,60 @@ app.put("/step-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async
   }
 });
 
+// Athlete app syncs nightly sleep summaries (incl. stage segments for the
+// pattern bars). Body: { nights: [{date, bed, wake, hours, segments}] }
+const SLEEP_STAGES = ["awake", "rem", "light", "deep", "asleep"];
+app.put("/sleep-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const nights = Array.isArray(req.body?.nights) ? req.body.nights.slice(0, 31) : [];
+    let saved = 0;
+    for (const n of nights) {
+      const date = String(n?.date || "");
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+      const bed = n?.bed ? String(n.bed).slice(0, 5) : null;
+      const wake = n?.wake ? String(n.wake).slice(0, 5) : null;
+      const hours = Math.max(0, Math.min(24, Number(n?.hours) || 0));
+      const segments = (Array.isArray(n?.segments) ? n.segments : []).slice(0, 120).map((g) => ({
+        leftPct: Math.max(0, Math.min(100, Number(g?.leftPct) || 0)),
+        widthPct: Math.max(0, Math.min(100, Number(g?.widthPct) || 0)),
+        stage: SLEEP_STAGES.includes(g?.stage) ? g.stage : "asleep",
+      }));
+      await pool.query(
+        `INSERT INTO sleep_logs (athlete_id, date, bed, wake, hours, segments, updated_at)
+         VALUES ($1, $2::date, $3, $4, $5, $6::jsonb, NOW())
+         ON CONFLICT (athlete_id, date)
+         DO UPDATE SET bed = EXCLUDED.bed, wake = EXCLUDED.wake, hours = EXCLUDED.hours,
+                       segments = EXCLUDED.segments, updated_at = NOW()`,
+        [athleteId, date, bed, wake, hours, JSON.stringify(segments)]
+      );
+      saved++;
+    }
+    return res.json({ ok: true, saved });
+  } catch (err) {
+    console.error("Sync sleep logs error:", err);
+    return res.status(500).json({ error: "Could not sync sleep" });
+  }
+});
+
+app.get("/sleep-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const start = req.query.start ? String(req.query.start) : null;
+    const end = req.query.end ? String(req.query.end) : null;
+    let q = `SELECT date::text AS date, bed, wake, hours, segments FROM sleep_logs WHERE athlete_id = $1`;
+    const params = [athleteId];
+    if (start) { params.push(start); q += ` AND date >= $${params.length}::date`; }
+    if (end) { params.push(end); q += ` AND date <= $${params.length}::date`; }
+    q += ` ORDER BY date ASC`;
+    const r = await pool.query(q, params);
+    return res.json(r.rows);
+  } catch (err) {
+    console.error("Get sleep logs error:", err);
+    return res.status(500).json({ error: "Could not fetch sleep" });
+  }
+});
+
 app.get("/step-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
@@ -3511,6 +3565,19 @@ app.listen(PORT, async () => {
     try { await pool.query(`ALTER TABLE coach_checkins ADD COLUMN time TEXT`); } catch (_) {}
     try { await pool.query(`ALTER TABLE users ADD COLUMN active BOOLEAN DEFAULT TRUE`); } catch (_) {}
     try { await pool.query(`ALTER TABLE users ADD COLUMN step_target INTEGER`); } catch (_) {}
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS sleep_logs (
+        id BIGSERIAL PRIMARY KEY,
+        athlete_id INTEGER NOT NULL,
+        date DATE NOT NULL,
+        bed TEXT,
+        wake TEXT,
+        hours NUMERIC,
+        segments JSONB DEFAULT '[]',
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE (athlete_id, date)
+      );
+    `);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS step_logs (
         id BIGSERIAL PRIMARY KEY,
