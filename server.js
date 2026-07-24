@@ -1579,6 +1579,80 @@ app.delete("/planned-meals/:athleteId/:date", requireAuth, requireCoach, async (
   }
 });
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STEPS — coach sets a daily step target; the athlete's app syncs HealthKit
+// step counts to the server so the coach can see them too.
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/step-target/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT step_target FROM users WHERE id = $1", [Number(req.params.athleteId)]);
+    return res.json({ steps: r.rows[0]?.step_target ?? null });
+  } catch (err) {
+    console.error("Get step target error:", err);
+    return res.status(500).json({ error: "Could not fetch step target" });
+  }
+});
+
+app.put("/athletes/:athleteId/step-target", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+    const raw = req.body?.steps;
+    const steps = raw === null || raw === "" || raw === undefined ? null : Math.max(0, Math.min(100000, Number(raw) || 0));
+    await pool.query("UPDATE users SET step_target = $1 WHERE id = $2 AND role NOT IN ('coach','admin')", [steps, athleteId]);
+    return res.json({ ok: true, steps });
+  } catch (err) {
+    console.error("Set step target error:", err);
+    return res.status(500).json({ error: "Could not save step target" });
+  }
+});
+
+// Athlete app syncs recent daily step counts. Body: { days: [{date, steps}] }
+app.put("/step-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const days = Array.isArray(req.body?.days) ? req.body.days.slice(0, 31) : [];
+    let saved = 0;
+    for (const d of days) {
+      const date = String(d?.date || "");
+      const steps = Math.max(0, Math.min(200000, Number(d?.steps) || 0));
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+      await pool.query(
+        `INSERT INTO step_logs (athlete_id, date, steps, updated_at)
+         VALUES ($1, $2::date, $3, NOW())
+         ON CONFLICT (athlete_id, date)
+         DO UPDATE SET steps = GREATEST(step_logs.steps, EXCLUDED.steps), updated_at = NOW()`,
+        [athleteId, date, steps]
+      );
+      saved++;
+    }
+    return res.json({ ok: true, saved });
+  } catch (err) {
+    console.error("Sync step logs error:", err);
+    return res.status(500).json({ error: "Could not sync steps" });
+  }
+});
+
+app.get("/step-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const start = req.query.start ? String(req.query.start) : null;
+    const end = req.query.end ? String(req.query.end) : null;
+    let q = `SELECT date::text AS date, steps FROM step_logs WHERE athlete_id = $1`;
+    const params = [athleteId];
+    if (start) { params.push(start); q += ` AND date >= $${params.length}::date`; }
+    if (end) { params.push(end); q += ` AND date <= $${params.length}::date`; }
+    q += ` ORDER BY date ASC`;
+    const r = await pool.query(q, params);
+    return res.json(r.rows);
+  } catch (err) {
+    console.error("Get step logs error:", err);
+    return res.status(500).json({ error: "Could not fetch steps" });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // HABITS (Wellbeing) — coach sets habits per athlete; athlete RAG-rates daily.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3436,6 +3510,17 @@ app.listen(PORT, async () => {
     // Bring older schemas up to date (time added later).
     try { await pool.query(`ALTER TABLE coach_checkins ADD COLUMN time TEXT`); } catch (_) {}
     try { await pool.query(`ALTER TABLE users ADD COLUMN active BOOLEAN DEFAULT TRUE`); } catch (_) {}
+    try { await pool.query(`ALTER TABLE users ADD COLUMN step_target INTEGER`); } catch (_) {}
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS step_logs (
+        id BIGSERIAL PRIMARY KEY,
+        athlete_id INTEGER NOT NULL,
+        date DATE NOT NULL,
+        steps INTEGER NOT NULL DEFAULT 0,
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE (athlete_id, date)
+      );
+    `);
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS habits (
