@@ -137,7 +137,7 @@ async function sendEmail(to, subject, html, extra = {}) {
 
 // Build an iCalendar invite for a coach check-in. Sent via nodemailer's
 // icalEvent so Gmail/Outlook render a proper "Add to calendar" invite.
-function buildCheckinIcs({ id, title, date, time, notes, linkUrl, organizerName }) {
+function buildCheckinIcs({ id, title, date, time, notes, linkUrl, organizerName, rrule }) {
   const dt = String(date).replace(/-/g, "");
   let dtStart, dtEnd, allDay = false;
   if (time) {
@@ -164,6 +164,7 @@ function buildCheckinIcs({ id, title, date, time, notes, linkUrl, organizerName 
     `DTSTAMP:${new Date().toISOString().replace(/[-:]/g, "").slice(0, 15)}Z`,
     allDay ? `DTSTART;VALUE=DATE:${dtStart}` : `DTSTART:${dtStart}`,
     allDay ? `DTEND;VALUE=DATE:${dtEnd}` : `DTEND:${dtEnd}`,
+    rrule ? `RRULE:${rrule}` : "",
     `SUMMARY:${esc(title || "Coach check-in")}`,
     desc ? `DESCRIPTION:${esc(desc)}` : "",
     linkUrl ? `LOCATION:${esc(linkUrl)}` : "",
@@ -1376,7 +1377,7 @@ app.get("/checkins/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async 
     const start = req.query.start ? String(req.query.start) : null;
     const end = req.query.end ? String(req.query.end) : null;
 
-    let q = `SELECT id, date::text AS date, time, title, link_url AS \"linkUrl\", notes, created_at
+    let q = `SELECT id, date::text AS date, time, title, link_url AS \"linkUrl\", notes, series_id AS \"seriesId\", created_at
              FROM coach_checkins
              WHERE athlete_id = $1`;
     const params = [athleteId];
@@ -1398,7 +1399,7 @@ app.post("/checkins/:athleteId", requireAuth, requireCoach, async (req, res) => 
     const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
     if (!ok) return res.status(404).json({ error: "Athlete not found" });
 
-    const { date, time, title, linkUrl, notes } = req.body || {};
+    const { date, time, title, linkUrl, notes, repeatWeekly, repeatWeeks } = req.body || {};
     if (!date || typeof date !== "string") return res.status(400).json({ error: "date is required" });
 
     const t = String(title || "Check-in").slice(0, 120);
@@ -1406,21 +1407,36 @@ app.post("/checkins/:athleteId", requireAuth, requireCoach, async (req, res) => 
     const l = linkUrl ? String(linkUrl).slice(0, 500) : null;
     const n = notes ? String(notes).slice(0, 2000) : null;
 
-    const result = await pool.query(
-      `INSERT INTO coach_checkins (athlete_id, date, time, title, link_url, notes, created_by, created_at)
-       VALUES ($1, $2::date, $3, $4, $5, $6, $7, NOW())
-       RETURNING id, date::text AS date, time, title, link_url AS \"linkUrl\", notes, created_at`,
-      [athleteId, date, tm, t, l, n, req.user.id]
-    );
+    // Weekly recurrence: materialise one row per week, linked by series_id, so
+    // every existing surface (athlete calendar, invite modal, coach list) just
+    // works. The coach can end the series any time.
+    const weeks = repeatWeekly ? Math.max(2, Math.min(52, Number(repeatWeeks) || 12)) : 1;
+    const seriesId = repeatWeekly ? `s${Date.now()}${Math.floor(Math.random() * 1e6)}` : null;
+    const addDays = (isoD, nDays) => {
+      const d = new Date(isoD + "T00:00:00");
+      d.setDate(d.getDate() + nDays);
+      return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+    };
 
-    const created = result.rows[0];
+    let created = null;
+    for (let i = 0; i < weeks; i++) {
+      const occDate = addDays(date, i * 7);
+      const result = await pool.query(
+        `INSERT INTO coach_checkins (athlete_id, date, time, title, link_url, notes, created_by, series_id, created_at)
+         VALUES ($1, $2::date, $3, $4, $5, $6, $7, $8, NOW())
+         RETURNING id, date::text AS date, time, title, link_url AS \"linkUrl\", notes, series_id AS \"seriesId\", created_at`,
+        [athleteId, occDate, tm, t, l, n, req.user.id, seriesId]
+      );
+      if (i === 0) created = result.rows[0];
+    }
+    created.repeatWeeks = weeks;
     // Notify the athlete that a check-in is due (fire-and-forget).
     const coachName = (await pool.query("SELECT name FROM users WHERE id=$1", [req.user.id])).rows[0]?.name || "Your coach";
     const whenStr = created.time ? `${created.date} at ${created.time}` : created.date;
     sendPushToUser(
       athleteId,
       "Check-in scheduled",
-      `${coachName} scheduled "${created.title}" for ${whenStr}`,
+      `${coachName} scheduled "${created.title}" for ${whenStr}${created.seriesId ? ` (repeats weekly)` : ""}`,
       { type: "checkin", checkinId: String(created.id) }
     );
 
@@ -1448,6 +1464,7 @@ app.post("/checkins/:athleteId", requireAuth, requireCoach, async (req, res) => 
           notes: created.notes,
           linkUrl: created.linkUrl,
           organizerName: coachName,
+          rrule: created.seriesId ? `FREQ=WEEKLY;COUNT=${created.repeatWeeks}` : null,
         });
         sendEmail(athlete.email, `Check-in: ${created.title} — ${ukDate}${created.time ? ` ${created.time}` : ""}`, html, {
           icalEvent: { filename: "checkin.ics", method: "REQUEST", content: ics },
@@ -1803,6 +1820,26 @@ app.put("/habit-ratings/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, a
   } catch (err) {
     console.error("Rate habit error:", err);
     return res.status(500).json({ error: "Could not save rating" });
+  }
+});
+
+// End a recurring series from a given date forward (past occurrences stay).
+app.delete("/checkins/:athleteId/series/:seriesId", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+    const from = req.query.from && /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.from))
+      ? String(req.query.from)
+      : new Date().toISOString().slice(0, 10);
+    const r = await pool.query(
+      `DELETE FROM coach_checkins WHERE athlete_id = $1 AND series_id = $2 AND date >= $3::date`,
+      [athleteId, String(req.params.seriesId), from]
+    );
+    return res.json({ ok: true, removed: r.rowCount });
+  } catch (err) {
+    console.error("End check-in series error:", err);
+    return res.status(500).json({ error: "Could not end the series" });
   }
 });
 
@@ -3563,6 +3600,7 @@ app.listen(PORT, async () => {
     `);
     // Bring older schemas up to date (time added later).
     try { await pool.query(`ALTER TABLE coach_checkins ADD COLUMN time TEXT`); } catch (_) {}
+    try { await pool.query(`ALTER TABLE coach_checkins ADD COLUMN series_id TEXT`); } catch (_) {}
     try { await pool.query(`ALTER TABLE users ADD COLUMN active BOOLEAN DEFAULT TRUE`); } catch (_) {}
     try { await pool.query(`ALTER TABLE users ADD COLUMN step_target INTEGER`); } catch (_) {}
     await pool.query(`
