@@ -3204,6 +3204,68 @@ function fetchJson(url) {
   });
 }
 
+// Work out whether a product is measured in millilitres (drinks, oils, sauces)
+// rather than grams. OFF always names its nutriment fields "_100g" even for
+// liquids, so the unit only affects how we LABEL portions — the numbers are
+// per 100g/100ml either way.
+function offDetectUnit(p) {
+  const qtyUnit = String(p.product_quantity_unit || "").toLowerCase();
+  if (qtyUnit === "ml" || qtyUnit === "cl" || qtyUnit === "l") return "ml";
+  const qty = String(p.quantity || "").toLowerCase();
+  if (/\d\s*(ml|cl|litre|liter|l)\b/.test(qty)) return "ml";
+  const cats = (Array.isArray(p.categories_tags) ? p.categories_tags : []).join(" ").toLowerCase();
+  if (/beverage|drink|water|juice|soda|milk|smoothie|coffee|tea|beer|wine|squash|cordial/.test(cats)) return "ml";
+  const serving = String(p.serving_size || "").toLowerCase();
+  if (/\d\s*(ml|cl)\b/.test(serving)) return "ml";
+  return "g";
+}
+
+// Build portion chips from OFF data: the product's own serving (e.g.
+// "1 slice (36g)"), the whole pack where sensible, and the 100g/100ml base.
+function offBuildServings(p, unit) {
+  const out = [];
+  const seen = new Set();
+  const push = (label, amount) => {
+    const amt = Math.round(Number(amount));
+    if (!Number.isFinite(amt) || amt <= 0 || amt > 5000) return;
+    const key = `${label}|${amt}`;
+    if (seen.has(key) || seen.has(String(amt))) return;
+    seen.add(key); seen.add(String(amt));
+    out.push([label, amt]);
+  };
+
+  // 1. The product's stated serving. serving_size is free text like
+  //    "1 slice (36 g)", "30g", "1 portion (125 g)", "330 ml".
+  const servingQty = Number(p.serving_quantity);
+  const servingText = String(p.serving_size || "").trim();
+  if (Number.isFinite(servingQty) && servingQty > 0) {
+    // Prefer the human part before the bracket ("1 slice"); fall back to
+    // a generic label when the text is just a measurement ("30g").
+    let label = servingText.split("(")[0].trim();
+    if (!label || /^[\d.,\s]*(g|ml|cl|kg|l|oz)?$/i.test(label)) label = "1 serving";
+    label = label.replace(/\s+/g, " ").slice(0, 24);
+    push(label, servingQty);
+  } else if (servingText) {
+    // No numeric serving_quantity — try to pull a number out of the text.
+    const m = servingText.match(/([\d.]+)\s*(g|ml)\b/i);
+    if (m) {
+      let label = servingText.split("(")[0].trim();
+      if (!label || /^[\d.,\s]*(g|ml)?$/i.test(label)) label = "1 serving";
+      push(label.slice(0, 24), Number(m[1]));
+    }
+  }
+
+  // 2. Whole pack/bottle, when it's a plausible single-sitting size.
+  const packQty = Number(p.product_quantity);
+  if (Number.isFinite(packQty) && packQty > 0 && packQty <= (unit === "ml" ? 1000 : 500)) {
+    push(unit === "ml" ? "Whole bottle" : "Whole pack", packQty);
+  }
+
+  // 3. Always offer the base unit last.
+  push(unit === "ml" ? "100ml" : "100g", 100);
+  return out;
+}
+
 function offProductToFood(p) {
   if (!p) return null;
   const n = p.nutriments || {};
@@ -3214,6 +3276,7 @@ function offProductToFood(p) {
   const fibre = Math.round(Number(n.fiber_100g || n.fiber || 0));
   const name = p.product_name || p.product_name_en || p.generic_name || "";
   if (!name) return null;
+  const unit = offDetectUnit(p);
   return {
     barcode: p.code || null,
     name,
@@ -3224,7 +3287,8 @@ function offProductToFood(p) {
     fat: fat,
     fibre: fibre,
     image: p.image_front_small_url || p.image_url || null,
-    servings: [["100g", 100]],
+    unit,
+    servings: offBuildServings(p, unit),
   };
 }
 
@@ -3257,8 +3321,8 @@ app.get("/off/search", requireAuth, async (req, res) => {
     const q = String(req.query.q || "").trim();
     if (q.length < 2) return res.json({ products: [] });
     // Prefer UK region for UK-centric product names; fall back to world if no results
-    const ukUrl = `https://uk.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=20&fields=code,product_name,product_name_en,brands,nutriments,image_front_small_url`;
-    const worldUrl = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=20&fields=code,product_name,product_name_en,brands,nutriments,image_front_small_url`;
+    const ukUrl = `https://uk.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=20&fields=code,product_name,product_name_en,brands,nutriments,image_front_small_url,serving_size,serving_quantity,quantity,product_quantity,product_quantity_unit,categories_tags`;
+    const worldUrl = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=20&fields=code,product_name,product_name_en,brands,nutriments,image_front_small_url,serving_size,serving_quantity,quantity,product_quantity,product_quantity_unit,categories_tags`;
     let data = null;
     try { data = await fetchJson(ukUrl); } catch (_) {}
     let products = Array.isArray(data?.products) ? data.products : [];
