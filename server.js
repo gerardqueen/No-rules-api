@@ -3025,7 +3025,7 @@ app.get("/foods/barcode/:code", requireAuth, async (req, res) => {
     if (!barcode) return res.status(400).json({ error: "Barcode required" });
     const r = await pool.query(
       `SELECT id, barcode, name, brand, calories, protein_g, carbs_g, fat_g, fibre_g,
-              serving_size, serving_unit, created_by, report_count, created_at
+              serving_size, serving_unit, serving_label, created_by, report_count, created_at
        FROM custom_foods WHERE barcode = $1 LIMIT 1`,
       [barcode]
     );
@@ -3044,7 +3044,7 @@ app.get("/foods/search", requireAuth, async (req, res) => {
     if (q.length < 2) return res.json([]);
     const r = await pool.query(
       `SELECT id, barcode, name, brand, calories, protein_g, carbs_g, fat_g, fibre_g,
-              serving_size, serving_unit, report_count
+              serving_size, serving_unit, serving_label, report_count
        FROM custom_foods
        WHERE LOWER(name) LIKE $1 OR LOWER(COALESCE(brand,'')) LIKE $1
        ORDER BY report_count ASC, name ASC
@@ -3061,7 +3061,7 @@ app.get("/foods/search", requireAuth, async (req, res) => {
 // Add a new food to the shared database
 app.post("/foods", requireAuth, async (req, res) => {
   try {
-    const { barcode, name, brand, calories, protein_g, carbs_g, fat_g, fibre_g, serving_size, serving_unit } = req.body || {};
+    const { barcode, name, brand, calories, protein_g, carbs_g, fat_g, fibre_g, serving_size, serving_unit, serving_label } = req.body || {};
     if (!name || typeof name !== "string") return res.status(400).json({ error: "Name is required" });
     const cals = Number(calories);
     if (!Number.isFinite(cals) || cals < 0) return res.status(400).json({ error: "Invalid calories" });
@@ -3073,9 +3073,9 @@ app.post("/foods", requireAuth, async (req, res) => {
     }
 
     const r = await pool.query(
-      `INSERT INTO custom_foods (barcode, name, brand, calories, protein_g, carbs_g, fat_g, fibre_g, serving_size, serving_unit, created_by, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
-       RETURNING id, barcode, name, brand, calories, protein_g, carbs_g, fat_g, fibre_g, serving_size, serving_unit, created_by, report_count`,
+      `INSERT INTO custom_foods (barcode, name, brand, calories, protein_g, carbs_g, fat_g, fibre_g, serving_size, serving_unit, serving_label, created_by, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
+       RETURNING id, barcode, name, brand, calories, protein_g, carbs_g, fat_g, fibre_g, serving_size, serving_unit, serving_label, created_by, report_count`,
       [
         barcode ? String(barcode).trim() : null,
         String(name).slice(0, 200),
@@ -3087,6 +3087,7 @@ app.post("/foods", requireAuth, async (req, res) => {
         Math.round(Number(fibre_g) || 0),
         Number(serving_size) || 100,
         String(serving_unit || "g").slice(0, 12),
+        serving_label ? String(serving_label).slice(0, 24) : null,
         req.user.id,
       ]
     );
@@ -3793,6 +3794,7 @@ app.listen(PORT, async () => {
       );
     `);
     try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_custom_foods_name ON custom_foods (LOWER(name))`); } catch {}
+    try { await pool.query(`ALTER TABLE custom_foods ADD COLUMN serving_label TEXT`); } catch {}
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS food_reports (
