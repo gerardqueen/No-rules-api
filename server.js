@@ -1688,6 +1688,63 @@ app.put("/sleep-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, asyn
   }
 });
 
+// Athlete app syncs workouts pulled from HealthKit / Health Connect.
+// Body: { workouts: [{externalId, date, type, startTime, minutes, calories, distanceKm, avgHr}] }
+app.put("/workout-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const rows = Array.isArray(req.body?.workouts) ? req.body.workouts.slice(0, 200) : [];
+    let saved = 0;
+    for (const w of rows) {
+      const date = String(w?.date || "");
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+      const externalId = String(w?.externalId || `${date}-${w?.type || "workout"}-${w?.startTime || ""}`).slice(0, 200);
+      await pool.query(
+        `INSERT INTO workout_logs (athlete_id, external_id, date, type, start_time, minutes, calories, distance_km, avg_hr, updated_at)
+         VALUES ($1,$2,$3::date,$4,$5,$6,$7,$8,$9,NOW())
+         ON CONFLICT (athlete_id, external_id)
+         DO UPDATE SET date = EXCLUDED.date, type = EXCLUDED.type, start_time = EXCLUDED.start_time,
+                       minutes = EXCLUDED.minutes, calories = EXCLUDED.calories,
+                       distance_km = EXCLUDED.distance_km, avg_hr = EXCLUDED.avg_hr, updated_at = NOW()`,
+        [
+          athleteId, externalId, date,
+          w?.type ? String(w.type).slice(0, 60) : "Workout",
+          w?.startTime ? String(w.startTime).slice(0, 5) : null,
+          Math.max(0, Math.min(1440, Number(w?.minutes) || 0)),
+          Math.max(0, Math.min(20000, Number(w?.calories) || 0)),
+          Math.max(0, Math.min(1000, Number(w?.distanceKm) || 0)),
+          Math.max(0, Math.min(250, Number(w?.avgHr) || 0)),
+        ]
+      );
+      saved++;
+    }
+    return res.json({ ok: true, saved });
+  } catch (err) {
+    console.error("Sync workouts error:", err);
+    return res.status(500).json({ error: "Could not sync workouts" });
+  }
+});
+
+app.get("/workout-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const start = req.query.start ? String(req.query.start) : null;
+    const end = req.query.end ? String(req.query.end) : null;
+    let q = `SELECT date::text AS date, type, start_time AS "startTime", minutes, calories,
+                    distance_km AS "distanceKm", avg_hr AS "avgHr"
+             FROM workout_logs WHERE athlete_id = $1`;
+    const params = [athleteId];
+    if (start) { params.push(start); q += ` AND date >= $${params.length}::date`; }
+    if (end) { params.push(end); q += ` AND date <= $${params.length}::date`; }
+    q += ` ORDER BY date DESC, start_time DESC`;
+    const r = await pool.query(q, params);
+    return res.json(r.rows);
+  } catch (err) {
+    console.error("Get workouts error:", err);
+    return res.status(500).json({ error: "Could not fetch workouts" });
+  }
+});
+
 app.get("/sleep-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
@@ -3668,6 +3725,24 @@ app.listen(PORT, async () => {
     try { await pool.query(`ALTER TABLE coach_checkins ADD COLUMN series_id TEXT`); } catch (_) {}
     try { await pool.query(`ALTER TABLE users ADD COLUMN active BOOLEAN DEFAULT TRUE`); } catch (_) {}
     try { await pool.query(`ALTER TABLE users ADD COLUMN step_target INTEGER`); } catch (_) {}
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS workout_logs (
+        id BIGSERIAL PRIMARY KEY,
+        athlete_id INTEGER NOT NULL,
+        external_id TEXT,
+        date DATE NOT NULL,
+        type TEXT,
+        start_time TEXT,
+        minutes NUMERIC,
+        calories NUMERIC,
+        distance_km NUMERIC,
+        avg_hr NUMERIC,
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE (athlete_id, external_id)
+      );
+    `);
+    try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_workout_logs_athlete_date ON workout_logs (athlete_id, date)`); } catch {}
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS sleep_logs (
         id BIGSERIAL PRIMARY KEY,
