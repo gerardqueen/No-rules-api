@@ -1781,6 +1781,7 @@ app.get("/step-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async
   }
 });
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 // HABITS (Wellbeing) — coach sets habits per athlete; athlete RAG-rates daily.
 // ─────────────────────────────────────────────────────────────────────────────
