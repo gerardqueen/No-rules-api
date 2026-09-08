@@ -1745,6 +1745,128 @@ app.get("/workout-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, as
   }
 });
 
+// ── BODY MEASUREMENTS (waist, hips, chest…) ─────────────────────────────────
+app.get("/measurements/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT date::text AS date, site, cm FROM measurements
+       WHERE athlete_id = $1 ORDER BY date ASC`,
+      [Number(req.params.athleteId)]
+    );
+    return res.json(r.rows);
+  } catch (err) {
+    console.error("Get measurements error:", err);
+    return res.status(500).json({ error: "Could not fetch measurements" });
+  }
+});
+
+// Body: { date, entries: { waist: 84, hips: 96, ... } } — blank/0 clears a site.
+app.post("/measurements/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const date = String(req.body?.date || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: "date (YYYY-MM-DD) required" });
+    const entries = req.body?.entries && typeof req.body.entries === "object" ? req.body.entries : {};
+    let saved = 0;
+    for (const [siteRaw, valRaw] of Object.entries(entries)) {
+      const site = String(siteRaw).slice(0, 24).toLowerCase();
+      if (!site) continue;
+      const cm = Number(valRaw);
+      if (!Number.isFinite(cm) || cm <= 0) {
+        await pool.query(`DELETE FROM measurements WHERE athlete_id = $1 AND date = $2::date AND site = $3`, [athleteId, date, site]);
+        continue;
+      }
+      if (cm > 400) continue; // implausible, ignore
+      await pool.query(
+        `INSERT INTO measurements (athlete_id, date, site, cm, updated_at)
+         VALUES ($1, $2::date, $3, $4, NOW())
+         ON CONFLICT (athlete_id, date, site)
+         DO UPDATE SET cm = EXCLUDED.cm, updated_at = NOW()`,
+        [athleteId, date, site, Math.round(cm * 10) / 10]
+      );
+      saved++;
+    }
+    const r = await pool.query(
+      `SELECT date::text AS date, site, cm FROM measurements WHERE athlete_id = $1 ORDER BY date ASC`,
+      [athleteId]
+    );
+    return res.json(r.rows);
+  } catch (err) {
+    console.error("Save measurements error:", err);
+    return res.status(500).json({ error: "Could not save measurements" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BODY MEASUREMENTS — waist, hips, chest etc. Logged by athlete or coach.
+// ─────────────────────────────────────────────────────────────────────────────
+const MEASURE_SITES = ["waist", "hips", "chest", "arm", "thigh", "neck", "calf", "shoulders"];
+
+app.get("/measurements/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const start = req.query.start ? String(req.query.start) : null;
+    const end = req.query.end ? String(req.query.end) : null;
+    let q = `SELECT date::text AS date, site, cm FROM body_measurements WHERE athlete_id = $1`;
+    const params = [athleteId];
+    if (start) { params.push(start); q += ` AND date >= $${params.length}::date`; }
+    if (end) { params.push(end); q += ` AND date <= $${params.length}::date`; }
+    q += ` ORDER BY date DESC, site ASC`;
+    const r = await pool.query(q, params);
+    // Group into one object per date: { date, sites: { waist: 82, ... } }
+    const byDate = {};
+    r.rows.forEach((row) => {
+      (byDate[row.date] = byDate[row.date] || { date: row.date, sites: {} }).sites[row.site] = Number(row.cm);
+    });
+    return res.json(Object.values(byDate).sort((a, b) => b.date.localeCompare(a.date)));
+  } catch (err) {
+    console.error("Get measurements error:", err);
+    return res.status(500).json({ error: "Could not fetch measurements" });
+  }
+});
+
+// Body: { date: "YYYY-MM-DD", sites: { waist: 82.5, hips: 96 } }
+// A site sent as null/"" removes that entry for the date.
+app.put("/measurements/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const date = String(req.body?.date || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: "date (YYYY-MM-DD) required" });
+    const sites = req.body?.sites && typeof req.body.sites === "object" ? req.body.sites : {};
+    let saved = 0;
+    for (const [rawSite, rawVal] of Object.entries(sites)) {
+      const site = String(rawSite).toLowerCase().slice(0, 24);
+      if (!MEASURE_SITES.includes(site)) continue;
+      if (rawVal === null || rawVal === "") {
+        await pool.query(`DELETE FROM body_measurements WHERE athlete_id = $1 AND date = $2::date AND site = $3`, [athleteId, date, site]);
+        continue;
+      }
+      const cm = Number(rawVal);
+      if (!Number.isFinite(cm) || cm <= 0 || cm > 300) continue;
+      await pool.query(
+        `INSERT INTO body_measurements (athlete_id, date, site, cm, updated_at)
+         VALUES ($1, $2::date, $3, $4, NOW())
+         ON CONFLICT (athlete_id, date, site)
+         DO UPDATE SET cm = EXCLUDED.cm, updated_at = NOW()`,
+        [athleteId, date, site, Math.round(cm * 10) / 10]
+      );
+      saved++;
+    }
+    const r = await pool.query(
+      `SELECT date::text AS date, site, cm FROM body_measurements WHERE athlete_id = $1 ORDER BY date DESC, site ASC`,
+      [athleteId]
+    );
+    const byDate = {};
+    r.rows.forEach((row) => {
+      (byDate[row.date] = byDate[row.date] || { date: row.date, sites: {} }).sites[row.site] = Number(row.cm);
+    });
+    return res.json({ ok: true, saved, measurements: Object.values(byDate).sort((a, b) => b.date.localeCompare(a.date)) });
+  } catch (err) {
+    console.error("Save measurements error:", err);
+    return res.status(500).json({ error: "Could not save measurements" });
+  }
+});
+
 app.get("/sleep-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
@@ -1781,6 +1903,56 @@ app.get("/step-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async
   }
 });
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BODY MEASUREMENTS — waist, hips, chest etc. in cm. Athlete or coach can log.
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/measurements/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const r = await pool.query(
+      `SELECT date::text AS date, site, cm FROM measurements
+       WHERE athlete_id = $1 ORDER BY date ASC`,
+      [athleteId]
+    );
+    return res.json(r.rows);
+  } catch (err) {
+    console.error("Get measurements error:", err);
+    return res.status(500).json({ error: "Could not fetch measurements" });
+  }
+});
+
+// Body: { date, entries: { waist: 84, hips: 98, ... } } — blank/0 values are skipped.
+app.post("/measurements/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const date = String(req.body?.date || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: "date (YYYY-MM-DD) required" });
+    const entries = req.body?.entries || {};
+    let saved = 0;
+    for (const [siteRaw, valRaw] of Object.entries(entries)) {
+      const site = String(siteRaw).slice(0, 32);
+      const cm = Number(valRaw);
+      if (!site || !Number.isFinite(cm) || cm <= 0 || cm > 400) continue;
+      await pool.query(
+        `INSERT INTO measurements (athlete_id, date, site, cm, updated_at)
+         VALUES ($1, $2::date, $3, $4, NOW())
+         ON CONFLICT (athlete_id, date, site)
+         DO UPDATE SET cm = EXCLUDED.cm, updated_at = NOW()`,
+        [athleteId, date, site, Math.round(cm * 10) / 10]
+      );
+      saved++;
+    }
+    const r = await pool.query(
+      `SELECT date::text AS date, site, cm FROM measurements WHERE athlete_id = $1 ORDER BY date ASC`,
+      [athleteId]
+    );
+    return res.json({ ok: true, saved, measurements: r.rows });
+  } catch (err) {
+    console.error("Save measurements error:", err);
+    return res.status(500).json({ error: "Could not save measurements" });
+  }
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HABITS (Wellbeing) — coach sets habits per athlete; athlete RAG-rates daily.
@@ -3727,6 +3899,19 @@ app.listen(PORT, async () => {
     try { await pool.query(`ALTER TABLE users ADD COLUMN active BOOLEAN DEFAULT TRUE`); } catch (_) {}
     try { await pool.query(`ALTER TABLE users ADD COLUMN step_target INTEGER`); } catch (_) {}
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS measurements (
+        id BIGSERIAL PRIMARY KEY,
+        athlete_id INTEGER NOT NULL,
+        date DATE NOT NULL,
+        site TEXT NOT NULL,
+        cm NUMERIC NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE (athlete_id, date, site)
+      );
+    `);
+    try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_measurements_athlete ON measurements (athlete_id, site, date)`); } catch {}
+
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS workout_logs (
         id BIGSERIAL PRIMARY KEY,
         athlete_id INTEGER NOT NULL,
@@ -3743,6 +3928,32 @@ app.listen(PORT, async () => {
       );
     `);
     try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_workout_logs_athlete_date ON workout_logs (athlete_id, date)`); } catch {}
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS measurements (
+        id BIGSERIAL PRIMARY KEY,
+        athlete_id INTEGER NOT NULL,
+        date DATE NOT NULL,
+        site TEXT NOT NULL,
+        cm NUMERIC NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE (athlete_id, date, site)
+      );
+    `);
+    try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_measurements_athlete ON measurements (athlete_id, site, date)`); } catch {}
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS body_measurements (
+        id BIGSERIAL PRIMARY KEY,
+        athlete_id INTEGER NOT NULL,
+        date DATE NOT NULL,
+        site TEXT NOT NULL,
+        cm NUMERIC NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE (athlete_id, date, site)
+      );
+    `);
+    try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_measurements_athlete_date ON body_measurements (athlete_id, date)`); } catch {}
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS sleep_logs (
