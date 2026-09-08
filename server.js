@@ -2409,10 +2409,10 @@ async function ensureMessagesTable() {
     `);
     console.log("✅ Messages table created");
   }
-  try { await pool.query(`ALTER TABLE messages ADD COLUMN message_type VARCHAR(20) DEFAULT 'chat'`); } catch (_) {}
-  try { await pool.query(`ALTER TABLE messages ADD COLUMN checkin_id INTEGER`); } catch (_) {}
-  try { await pool.query(`ALTER TABLE messages ADD COLUMN thread_id BIGINT`); } catch (_) {}
-  try { await pool.query(`ALTER TABLE messages ADD COLUMN subject TEXT`); } catch (_) {}
+  try { await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS message_type VARCHAR(20) DEFAULT 'chat'`); } catch (_) {}
+  try { await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS checkin_id INTEGER`); } catch (_) {}
+  try { await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS thread_id BIGINT`); } catch (_) {}
+  try { await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS subject TEXT`); } catch (_) {}
   messagesTableReady = true;
 }
 
@@ -3590,13 +3590,13 @@ async function ensureCoachVideosTable() {
       )
     `);
     // Bring older schemas up to date
-    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN title TEXT`); } catch {}
-    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN youtube_id TEXT`); } catch {}
-    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN category TEXT DEFAULT 'General'`); } catch {}
-    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN notes TEXT`); } catch {}
-    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN created_by INTEGER`); } catch {}
-    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN created_at TIMESTAMPTZ DEFAULT NOW()`); } catch {}
-    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN athlete_id INTEGER`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS title TEXT`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS youtube_id TEXT`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'General'`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS notes TEXT`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS created_by INTEGER`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS athlete_id INTEGER`); } catch {}
     try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_coach_videos_athlete ON coach_videos (athlete_id, created_at DESC)`); } catch {}
   } catch (e) { console.error("ensureCoachVideosTable error:", e); }
   coachVideosTableReady = true;
@@ -3894,10 +3894,10 @@ app.listen(PORT, async () => {
       );
     `);
     // Bring older schemas up to date (time added later).
-    try { await pool.query(`ALTER TABLE coach_checkins ADD COLUMN time TEXT`); } catch (_) {}
-    try { await pool.query(`ALTER TABLE coach_checkins ADD COLUMN series_id TEXT`); } catch (_) {}
-    try { await pool.query(`ALTER TABLE users ADD COLUMN active BOOLEAN DEFAULT TRUE`); } catch (_) {}
-    try { await pool.query(`ALTER TABLE users ADD COLUMN step_target INTEGER`); } catch (_) {}
+    try { await pool.query(`ALTER TABLE coach_checkins ADD COLUMN IF NOT EXISTS time TEXT`); } catch (_) {}
+    try { await pool.query(`ALTER TABLE coach_checkins ADD COLUMN IF NOT EXISTS series_id TEXT`); } catch (_) {}
+    try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE`); } catch (_) {}
+    try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS step_target INTEGER`); } catch (_) {}
     await pool.query(`
       CREATE TABLE IF NOT EXISTS measurements (
         id BIGSERIAL PRIMARY KEY,
@@ -4081,7 +4081,7 @@ app.listen(PORT, async () => {
       );
     `);
     try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_custom_foods_name ON custom_foods (LOWER(name))`); } catch {}
-    try { await pool.query(`ALTER TABLE custom_foods ADD COLUMN serving_label TEXT`); } catch {}
+    try { await pool.query(`ALTER TABLE custom_foods ADD COLUMN IF NOT EXISTS serving_label TEXT`); } catch {}
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS food_reports (
