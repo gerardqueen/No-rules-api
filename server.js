@@ -269,10 +269,18 @@ app.post("/auth/login", async (req, res) => {
       return res.status(403).json({ error: "This account is paused. Contact your coach to reactivate it." });
     }
 
+    // Session length. Athletes on a phone shouldn't be signed out daily, so
+    // the default is 30 days; coaches/admins get a shorter window because the
+    // CMS is often on shared or desktop machines. Override with SESSION_DAYS
+    // (athletes) / SESSION_DAYS_STAFF without a code change.
+    const isStaff = user.role === "coach" || user.role === "admin";
+    const days = isStaff
+      ? Math.max(1, Math.min(90, Number(process.env.SESSION_DAYS_STAFF) || 7))
+      : Math.max(1, Math.min(180, Number(process.env.SESSION_DAYS) || 30));
     const token = jwt.sign(
       { id: user.id, email: user.email, role: user.role, name: user.name },
       process.env.JWT_SECRET,
-      { expiresIn: "24h" }
+      { expiresIn: `${days}d` }
     );
 
     return res.json({
