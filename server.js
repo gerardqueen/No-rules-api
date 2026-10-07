@@ -248,6 +248,110 @@ async function requireAdmin(req, res, next) {
 // ─────────────────────────────────────────────────────────────────────────────
 // AUTH
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// SELF-SIGNUP — anyone can create an account and use the app without a coach.
+//
+// A self-serve account has coach_id = NULL. The app runs in "solo" mode for
+// those users: food diary, scanner, wellbeing and the community food database
+// all work; coach-dependent features (macro plan, check-ins, programming,
+// coach messaging) stay hidden until a coach adds them to a roster.
+//
+// marketingOptIn comes from the tick box on the signup form. Nothing is sent
+// to a user who didn't tick it; coaches can list opted-in users via
+// GET /users/directory?optedIn=1.
+// ─────────────────────────────────────────────────────────────────────────────
+const SIGNUP_OPEN = String(process.env.SIGNUP_OPEN || "true").toLowerCase() !== "false";
+
+function issueToken(user) {
+  const isStaff = user.role === "coach" || user.role === "admin";
+  const days = isStaff
+    ? Math.max(1, Math.min(90, Number(process.env.SESSION_DAYS_STAFF) || 7))
+    : Math.max(1, Math.min(180, Number(process.env.SESSION_DAYS) || 30));
+  return jwt.sign(
+    { id: user.id, email: user.email, role: user.role, name: user.name },
+    process.env.JWT_SECRET,
+    { expiresIn: `${days}d` }
+  );
+}
+
+app.post("/auth/register", async (req, res) => {
+  try {
+    if (!SIGNUP_OPEN) {
+      return res.status(403).json({ error: "New accounts are closed right now. Contact your coach for an invite." });
+    }
+    const name = String(req.body?.name || "").trim();
+    const email = String(req.body?.email || "").toLowerCase().trim();
+    const password = String(req.body?.password || "");
+    const marketingOptIn = req.body?.marketingOptIn === true || req.body?.marketingOptIn === "true";
+
+    if (!name || name.length < 2) return res.status(400).json({ error: "Please enter your name." });
+    if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ error: "Please enter a valid email address." });
+    if (password.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters." });
+
+    const existing = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
+    if (existing.rows.length) {
+      return res.status(409).json({ error: "An account already exists with that email. Try signing in, or use 'Forgot password?'." });
+    }
+
+    const hash = await bcrypt.hash(password, 10);
+    const ins = await pool.query(
+      `INSERT INTO users (email, password_hash, name, role, coach_id, active, marketing_opt_in, signup_source, created_at)
+       VALUES ($1, $2, $3, 'athlete', NULL, TRUE, $4, 'self', NOW())
+       RETURNING id, email, name, role, sport, mfp_username, coach_id, avatar_url, marketing_opt_in`,
+      [email, hash, name.slice(0, 120), marketingOptIn]
+    );
+    const user = ins.rows[0];
+    const token = issueToken(user);
+
+    // Welcome email (fire-and-forget — signup must not fail if SMTP is down).
+    if (mailer) {
+      sendEmail(
+        email,
+        "Welcome to No Rule Nutrition",
+        `<div style="font-family:Arial,Helvetica,sans-serif;max-width:560px">
+           <h2 style="margin:0 0 12px">Welcome, ${name.replace(/[<>]/g, "")}.</h2>
+           <p style="margin:0 0 12px;line-height:1.6">Your No Rule Nutrition account is live. You can start logging food straight away — scan a barcode, search the database, or add your own foods.</p>
+           <p style="margin:0 0 12px;line-height:1.6">Working with a coach? Ask them to add your email (<b>${email}</b>) to their roster and your plan, check-ins and programming will appear automatically.</p>
+           <p style="margin:0;color:#888;font-size:12px">You're receiving this because you created an account. ${marketingOptIn ? "You opted in to tips and updates — you can opt out any time from your profile." : ""}</p>
+         </div>`
+      ).catch(() => {});
+    }
+
+    return res.status(201).json({
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        sport: user.sport,
+        mfpUsername: user.mfp_username,
+        coachId: user.coach_id,
+        avatarUrl: user.avatar_url,
+        marketingOptIn: user.marketing_opt_in === true,
+      },
+    });
+  } catch (err) {
+    console.error("Register error:", err);
+    return res.status(500).json({ error: "Could not create your account — try again shortly." });
+  }
+});
+
+// Whether the app should show a "Create account" button. Public on purpose.
+app.get("/auth/signup-open", (_req, res) => res.json({ open: SIGNUP_OPEN }));
+
+// Change your own marketing preference (the tick box, after signup).
+app.put("/me/marketing", requireAuth, async (req, res) => {
+  try {
+    const optIn = req.body?.marketingOptIn === true || req.body?.marketingOptIn === "true";
+    await pool.query(`UPDATE users SET marketing_opt_in = $1 WHERE id = $2`, [optIn, req.user.id]);
+    return res.json({ ok: true, marketingOptIn: optIn });
+  } catch (err) {
+    console.error("Marketing pref error:", err);
+    return res.status(500).json({ error: "Could not save that preference" });
+  }
+});
+
 app.post("/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body || {};
@@ -272,16 +376,8 @@ app.post("/auth/login", async (req, res) => {
     // Session length. Athletes on a phone shouldn't be signed out daily, so
     // the default is 30 days; coaches/admins get a shorter window because the
     // CMS is often on shared or desktop machines. Override with SESSION_DAYS
-    // (athletes) / SESSION_DAYS_STAFF without a code change.
-    const isStaff = user.role === "coach" || user.role === "admin";
-    const days = isStaff
-      ? Math.max(1, Math.min(90, Number(process.env.SESSION_DAYS_STAFF) || 7))
-      : Math.max(1, Math.min(180, Number(process.env.SESSION_DAYS) || 30));
-    const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role, name: user.name },
-      process.env.JWT_SECRET,
-      { expiresIn: `${days}d` }
-    );
+    // (athletes) / SESSION_DAYS_STAFF without a code change. (issueToken)
+    const token = issueToken(user);
 
     return res.json({
       token,
@@ -294,6 +390,7 @@ app.post("/auth/login", async (req, res) => {
         mfpUsername: user.mfp_username,
         coachId: user.coach_id,
         avatarUrl: user.avatar_url,
+        marketingOptIn: user.marketing_opt_in === true,
       },
     });
   } catch (err) {
@@ -396,8 +493,12 @@ app.post("/auth/reset-password", async (req, res) => {
 app.get("/auth/me", requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, email, name, role, sport, mfp_username, coach_id, avatar_url
-       FROM users WHERE id = $1`,
+      `SELECT u.id, u.email, u.name, u.role, u.sport, u.mfp_username, u.coach_id,
+              u.avatar_url, u.sex, u.programming_enabled, u.marketing_opt_in, u.signup_source,
+              c.name AS coach_name
+         FROM users u
+         LEFT JOIN users c ON c.id = u.coach_id
+        WHERE u.id = $1`,
       [req.user.id]
     );
 
@@ -412,7 +513,12 @@ app.get("/auth/me", requireAuth, async (req, res) => {
       sport: user.sport,
       mfpUsername: user.mfp_username,
       coachId: user.coach_id,
+      coachName: user.coach_name || null,
       avatarUrl: user.avatar_url,
+      sex: user.sex || null,
+      programmingEnabled: user.programming_enabled === true,
+      marketingOptIn: user.marketing_opt_in === true,
+      signupSource: user.signup_source || "coach",
     });
   } catch (err) {
     console.error("Auth/me error:", err);
@@ -473,7 +579,7 @@ async function requireSelfOrCoachOfAthlete(req, res, next) {
 app.get("/athletes", requireAuth, requireCoach, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, email, name, role, sport, mfp_username, avatar_url, active, created_at
+      `SELECT id, email, name, role, sport, mfp_username, avatar_url, active, sex, programming_enabled, created_at
        FROM users
        WHERE coach_id = $1 AND role NOT IN ('coach','admin')
        ORDER BY name ASC`,
@@ -1805,6 +1911,150 @@ app.post("/measurements/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, a
   }
 });
 
+// Set an athlete's sex, which decides the measurement sites offered
+// (e.g. under-bust for women, neck/chest for men). Either the athlete or
+// their coach can set it.
+app.patch("/athletes/:athleteId/sex", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const raw = String(req.body?.sex || "").toLowerCase();
+    const sex = ["male", "female", "unspecified"].includes(raw) ? raw : null;
+    if (!sex) return res.status(400).json({ error: "sex must be male, female or unspecified" });
+    await pool.query("UPDATE users SET sex = $1 WHERE id = $2", [sex === "unspecified" ? null : sex, athleteId]);
+    return res.json({ ok: true, sex });
+  } catch (err) {
+    console.error("Set sex error:", err);
+    return res.status(500).json({ error: "Could not save" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PROGRAMMING — optional per-athlete training programming. One free-text block
+// per day, written by the coach, read by the athlete. Deliberately simple:
+// the coach types whatever they want (multi-line) and it shows as written.
+// ─────────────────────────────────────────────────────────────────────────────
+app.patch("/athletes/:athleteId/programming-enabled", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+    const enabled = !!req.body?.enabled;
+    await pool.query("UPDATE users SET programming_enabled = $1 WHERE id = $2", [enabled, athleteId]);
+    return res.json({ ok: true, enabled });
+  } catch (err) {
+    console.error("Toggle programming error:", err);
+    return res.status(500).json({ error: "Could not update programming setting" });
+  }
+});
+
+app.get("/programming/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const start = req.query.start ? String(req.query.start) : null;
+    const end = req.query.end ? String(req.query.end) : null;
+    let q = `SELECT date::text AS date, body, sessions, updated_at FROM programming
+             WHERE athlete_id = $1 AND (body <> '' OR jsonb_array_length(COALESCE(sessions,'[]'::jsonb)) > 0)`;
+    const params = [athleteId];
+    if (start) { params.push(start); q += ` AND date >= $${params.length}::date`; }
+    if (end) { params.push(end); q += ` AND date <= $${params.length}::date`; }
+    q += ` ORDER BY date ASC`;
+    const r = await pool.query(q, params);
+    // Normalise: always hand back a sessions array. Days saved before
+    // multi-session support become a single untitled session.
+    const rows = r.rows.map((row) => {
+      const sess = Array.isArray(row.sessions) ? row.sessions : [];
+      if (sess.length === 0 && row.body) {
+        return { date: row.date, sessions: [{ title: "Session", time: null, body: row.body }], updated_at: row.updated_at };
+      }
+      return { date: row.date, sessions: sess, updated_at: row.updated_at };
+    });
+    return res.json(rows);
+  } catch (err) {
+    console.error("Get programming error:", err);
+    return res.status(500).json({ error: "Could not fetch programming" });
+  }
+});
+
+// Body: { date, body }. An empty body clears that day.
+app.put("/programming/:athleteId", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+    const date = String(req.body?.date || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: "date (YYYY-MM-DD) required" });
+    // Preferred shape: sessions[]. A plain `body` is still accepted and stored
+    // as one session, so older clients keep working.
+    const rawSessions = Array.isArray(req.body?.sessions) ? req.body.sessions : null;
+    const legacyBody = String(req.body?.body ?? "");
+    const sessions = (rawSessions !== null
+      ? rawSessions
+      : (legacyBody.trim() ? [{ title: "Session", time: null, body: legacyBody }] : [])
+    )
+      .slice(0, 8)
+      .map((x) => ({
+        title: String(x?.title || "Session").slice(0, 60),
+        time: x?.time ? String(x.time).slice(0, 5) : null,
+        body: String(x?.body ?? "").slice(0, 8000),
+      }))
+      .filter((x) => x.body.trim());
+
+    if (sessions.length === 0) {
+      await pool.query("DELETE FROM programming WHERE athlete_id = $1 AND date = $2::date", [athleteId, date]);
+      return res.json({ ok: true, cleared: true });
+    }
+    await pool.query(
+      `INSERT INTO programming (athlete_id, date, body, sessions, updated_by, updated_at)
+       VALUES ($1, $2::date, '', $3::jsonb, $4, NOW())
+       ON CONFLICT (athlete_id, date)
+       DO UPDATE SET body = '', sessions = EXCLUDED.sessions,
+                     updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+      [athleteId, date, JSON.stringify(sessions), req.user.id]
+    );
+    return res.json({ ok: true, sessions: sessions.length });
+  } catch (err) {
+    console.error("Save programming error:", err);
+    return res.status(500).json({ error: "Could not save programming" });
+  }
+});
+
+// Bulk upload: [{date, body}, …] — the hook for a CSV import later.
+app.post("/programming/:athleteId/bulk", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+    const days = Array.isArray(req.body?.days) ? req.body.days.slice(0, 200) : [];
+    let saved = 0;
+    for (const d of days) {
+      const date = String(d?.date || "");
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+      const sess = (Array.isArray(d?.sessions) ? d.sessions : (d?.body ? [{ title: "Session", time: null, body: d.body }] : []))
+        .slice(0, 8)
+        .map((x) => ({
+          title: String(x?.title || "Session").slice(0, 60),
+          time: x?.time ? String(x.time).slice(0, 5) : null,
+          body: String(x?.body ?? "").slice(0, 8000),
+        }))
+        .filter((x) => x.body.trim());
+      if (sess.length === 0) continue;
+      await pool.query(
+        `INSERT INTO programming (athlete_id, date, body, sessions, updated_by, updated_at)
+         VALUES ($1, $2::date, '', $3::jsonb, $4, NOW())
+         ON CONFLICT (athlete_id, date)
+         DO UPDATE SET body = '', sessions = EXCLUDED.sessions,
+                       updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+        [athleteId, date, JSON.stringify(sess), req.user.id]
+      );
+      saved++;
+    }
+    return res.json({ ok: true, saved });
+  } catch (err) {
+    console.error("Bulk programming error:", err);
+    return res.status(500).json({ error: "Could not import programming" });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // BODY MEASUREMENTS — waist, hips, chest etc. Logged by athlete or coach.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1911,6 +2161,150 @@ app.get("/step-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async
   }
 });
 
+
+// Set an athlete's sex, which decides the measurement sites offered
+// (e.g. under-bust for women, neck/chest for men). Either the athlete or
+// their coach can set it.
+app.patch("/athletes/:athleteId/sex", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const raw = String(req.body?.sex || "").toLowerCase();
+    const sex = ["male", "female", "unspecified"].includes(raw) ? raw : null;
+    if (!sex) return res.status(400).json({ error: "sex must be male, female or unspecified" });
+    await pool.query("UPDATE users SET sex = $1 WHERE id = $2", [sex === "unspecified" ? null : sex, athleteId]);
+    return res.json({ ok: true, sex });
+  } catch (err) {
+    console.error("Set sex error:", err);
+    return res.status(500).json({ error: "Could not save" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PROGRAMMING — optional per-athlete training programming. One free-text block
+// per day, written by the coach, read by the athlete. Deliberately simple:
+// the coach types whatever they want (multi-line) and it shows as written.
+// ─────────────────────────────────────────────────────────────────────────────
+app.patch("/athletes/:athleteId/programming-enabled", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+    const enabled = !!req.body?.enabled;
+    await pool.query("UPDATE users SET programming_enabled = $1 WHERE id = $2", [enabled, athleteId]);
+    return res.json({ ok: true, enabled });
+  } catch (err) {
+    console.error("Toggle programming error:", err);
+    return res.status(500).json({ error: "Could not update programming setting" });
+  }
+});
+
+app.get("/programming/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const start = req.query.start ? String(req.query.start) : null;
+    const end = req.query.end ? String(req.query.end) : null;
+    let q = `SELECT date::text AS date, body, sessions, updated_at FROM programming
+             WHERE athlete_id = $1 AND (body <> '' OR jsonb_array_length(COALESCE(sessions,'[]'::jsonb)) > 0)`;
+    const params = [athleteId];
+    if (start) { params.push(start); q += ` AND date >= $${params.length}::date`; }
+    if (end) { params.push(end); q += ` AND date <= $${params.length}::date`; }
+    q += ` ORDER BY date ASC`;
+    const r = await pool.query(q, params);
+    // Normalise: always hand back a sessions array. Days saved before
+    // multi-session support become a single untitled session.
+    const rows = r.rows.map((row) => {
+      const sess = Array.isArray(row.sessions) ? row.sessions : [];
+      if (sess.length === 0 && row.body) {
+        return { date: row.date, sessions: [{ title: "Session", time: null, body: row.body }], updated_at: row.updated_at };
+      }
+      return { date: row.date, sessions: sess, updated_at: row.updated_at };
+    });
+    return res.json(rows);
+  } catch (err) {
+    console.error("Get programming error:", err);
+    return res.status(500).json({ error: "Could not fetch programming" });
+  }
+});
+
+// Body: { date, body }. An empty body clears that day.
+app.put("/programming/:athleteId", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+    const date = String(req.body?.date || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: "date (YYYY-MM-DD) required" });
+    // Preferred shape: sessions[]. A plain `body` is still accepted and stored
+    // as one session, so older clients keep working.
+    const rawSessions = Array.isArray(req.body?.sessions) ? req.body.sessions : null;
+    const legacyBody = String(req.body?.body ?? "");
+    const sessions = (rawSessions !== null
+      ? rawSessions
+      : (legacyBody.trim() ? [{ title: "Session", time: null, body: legacyBody }] : [])
+    )
+      .slice(0, 8)
+      .map((x) => ({
+        title: String(x?.title || "Session").slice(0, 60),
+        time: x?.time ? String(x.time).slice(0, 5) : null,
+        body: String(x?.body ?? "").slice(0, 8000),
+      }))
+      .filter((x) => x.body.trim());
+
+    if (sessions.length === 0) {
+      await pool.query("DELETE FROM programming WHERE athlete_id = $1 AND date = $2::date", [athleteId, date]);
+      return res.json({ ok: true, cleared: true });
+    }
+    await pool.query(
+      `INSERT INTO programming (athlete_id, date, body, sessions, updated_by, updated_at)
+       VALUES ($1, $2::date, '', $3::jsonb, $4, NOW())
+       ON CONFLICT (athlete_id, date)
+       DO UPDATE SET body = '', sessions = EXCLUDED.sessions,
+                     updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+      [athleteId, date, JSON.stringify(sessions), req.user.id]
+    );
+    return res.json({ ok: true, sessions: sessions.length });
+  } catch (err) {
+    console.error("Save programming error:", err);
+    return res.status(500).json({ error: "Could not save programming" });
+  }
+});
+
+// Bulk upload: [{date, body}, …] — the hook for a CSV import later.
+app.post("/programming/:athleteId/bulk", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
+    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+    const days = Array.isArray(req.body?.days) ? req.body.days.slice(0, 200) : [];
+    let saved = 0;
+    for (const d of days) {
+      const date = String(d?.date || "");
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+      const sess = (Array.isArray(d?.sessions) ? d.sessions : (d?.body ? [{ title: "Session", time: null, body: d.body }] : []))
+        .slice(0, 8)
+        .map((x) => ({
+          title: String(x?.title || "Session").slice(0, 60),
+          time: x?.time ? String(x.time).slice(0, 5) : null,
+          body: String(x?.body ?? "").slice(0, 8000),
+        }))
+        .filter((x) => x.body.trim());
+      if (sess.length === 0) continue;
+      await pool.query(
+        `INSERT INTO programming (athlete_id, date, body, sessions, updated_by, updated_at)
+         VALUES ($1, $2::date, '', $3::jsonb, $4, NOW())
+         ON CONFLICT (athlete_id, date)
+         DO UPDATE SET body = '', sessions = EXCLUDED.sessions,
+                       updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+        [athleteId, date, JSON.stringify(sess), req.user.id]
+      );
+      saved++;
+    }
+    return res.json({ ok: true, saved });
+  } catch (err) {
+    console.error("Bulk programming error:", err);
+    return res.status(500).json({ error: "Could not import programming" });
+  }
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BODY MEASUREMENTS — waist, hips, chest etc. in cm. Athlete or coach can log.
@@ -2428,44 +2822,208 @@ async function ensureMessagesTable() {
 // MESSAGES (coach <-> athlete)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Broadcast from coach to all their athletes (MUST be before :toId route)
+// Resolve a broadcast audience to a list of recipient user ids.
+//
+//   "clients"  — only the people on this coach's roster (the original behaviour)
+//   "coached"  — every account that has a coach, whoever it is
+//   "all"      — every account, including self-signups with no coach
+//   "selected" — the explicit ids passed in recipientIds
+//
+// Staff accounts (coach/admin) and paused accounts are never included, and the
+// sender is never messaged by themselves.
+async function resolveAudience(senderId, audience, recipientIds) {
+  const aud = String(audience || "clients").toLowerCase();
+  let sql, params;
+  if (aud === "selected") {
+    const ids = (Array.isArray(recipientIds) ? recipientIds : [])
+      .map((n) => Number(n))
+      .filter((n) => Number.isFinite(n) && n > 0)
+      .slice(0, 5000);
+    if (!ids.length) return { ids: [], aud };
+    sql = `SELECT id FROM users
+            WHERE id = ANY($1::int[]) AND role NOT IN ('coach','admin')
+              AND COALESCE(active, TRUE) = TRUE AND id <> $2`;
+    params = [ids, senderId];
+  } else if (aud === "all") {
+    sql = `SELECT id FROM users
+            WHERE role NOT IN ('coach','admin')
+              AND COALESCE(active, TRUE) = TRUE AND id <> $1`;
+    params = [senderId];
+  } else if (aud === "coached") {
+    sql = `SELECT id FROM users
+            WHERE role NOT IN ('coach','admin') AND coach_id IS NOT NULL
+              AND COALESCE(active, TRUE) = TRUE AND id <> $1`;
+    params = [senderId];
+  } else {
+    sql = `SELECT id FROM users
+            WHERE coach_id = $1 AND role NOT IN ('coach','admin')
+              AND COALESCE(active, TRUE) = TRUE`;
+    params = [senderId];
+  }
+  const r = await pool.query(sql, params);
+  return { ids: r.rows.map((x) => x.id), aud };
+}
+
+// Broadcast from a coach (MUST be before the :toId route).
+//
+// Body: { content, audience?, recipientIds?, subject? }
+// audience defaults to "clients" so older app builds keep working unchanged.
 app.post("/messages/broadcast", requireAuth, requireCoach, async (req, res) => {
   try {
     await ensureMessagesTable();
     const coachId = req.user.id;
-    const { content } = req.body || {};
+    const { content, audience, recipientIds, subject } = req.body || {};
     if (!content || typeof content !== "string" || !content.trim()) {
       return res.status(400).json({ error: "Message content is required" });
     }
-    const athletes = await pool.query(
-      `SELECT id FROM users WHERE coach_id=$1 AND role NOT IN ('coach','admin')`,
-      [coachId]
-    );
+
+    const { ids, aud } = await resolveAudience(coachId, audience, recipientIds);
+    if (!ids.length) {
+      return res.status(400).json({ error: "No one matched that audience — nothing was sent." });
+    }
+
     const msg = content.trim().slice(0, 5000);
+    const subj = subject && String(subject).trim()
+      ? String(subject).trim().slice(0, 120)
+      : "📢 Announcement";
+
     let sent = 0;
-    for (const a of athletes.rows) {
-      await pool.query(
-        `WITH ins AS (
-           INSERT INTO messages (from_id, to_id, content, message_type, subject, created_at)
-           VALUES ($1,$2,$3,'broadcast','📢 Announcement',NOW())
-           RETURNING id
-         ) UPDATE messages SET thread_id = ins.id FROM ins WHERE messages.id = ins.id`,
-        [coachId, a.id, msg]
+    for (const id of ids) {
+      // Two statements on purpose: a single INSERT…RETURNING wrapped in a CTE
+      // that UPDATEs the same row does nothing, because the UPDATE can't see
+      // rows the CTE just inserted. thread_id must be set in its own statement
+      // or the broadcast has no thread and replies can't attach to it.
+      const ins = await pool.query(
+        `INSERT INTO messages (from_id, to_id, content, message_type, subject, created_at)
+         VALUES ($1,$2,$3,'broadcast',$4,NOW())
+         RETURNING id`,
+        [coachId, id, msg, subj]
       );
+      const newId = ins.rows[0]?.id;
+      if (newId) await pool.query(`UPDATE messages SET thread_id = $1 WHERE id = $1`, [newId]);
       sent++;
     }
-    // Notify all recipients of the broadcast (fire-and-forget).
+
+    // Notify all recipients (fire-and-forget).
     const coachName = (await pool.query("SELECT name FROM users WHERE id=$1", [coachId])).rows[0]?.name || "Your coach";
     sendPushToUsers(
-      athletes.rows.map((a) => a.id),
+      ids,
       `Message from ${coachName}`,
       msg.slice(0, 120),
       { type: "broadcast", fromId: String(coachId) }
     );
-    return res.json({ ok: true, sent });
+    return res.json({ ok: true, sent, audience: aud });
   } catch (err) {
     console.error("Broadcast error:", err);
     return res.status(500).json({ error: "Could not broadcast" });
+  }
+});
+
+// Audience sizes, so the CMS can show "to 24 people" before sending.
+app.get("/messages/audience-counts", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const me = req.user.id;
+    const r = await pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE coach_id = $1)                       AS clients,
+         COUNT(*) FILTER (WHERE coach_id IS NOT NULL)                AS coached,
+         COUNT(*)                                                    AS all_users,
+         COUNT(*) FILTER (WHERE coach_id IS NULL)                    AS unattached,
+         COUNT(*) FILTER (WHERE marketing_opt_in IS TRUE)            AS opted_in
+       FROM users
+       WHERE role NOT IN ('coach','admin') AND COALESCE(active, TRUE) = TRUE`,
+      [me]
+    );
+    const row = r.rows[0] || {};
+    return res.json({
+      clients: Number(row.clients || 0),
+      coached: Number(row.coached || 0),
+      all: Number(row.all_users || 0),
+      unattached: Number(row.unattached || 0),
+      optedIn: Number(row.opted_in || 0),
+    });
+  } catch (err) {
+    console.error("Audience counts error:", err);
+    return res.status(500).json({ error: "Could not load audience counts" });
+  }
+});
+
+// Directory of every athlete account, so a coach can message specific people
+// (including self-signups who aren't on anyone's roster) and claim unattached
+// users onto their own roster.
+//
+// Query: ?q=search  &scope=all|mine|unattached|coached  &optedIn=1  &limit=
+app.get("/users/directory", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim().toLowerCase();
+    const scope = String(req.query.scope || "all").toLowerCase();
+    const optedIn = String(req.query.optedIn || "") === "1";
+    const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 200));
+
+    const where = [`u.role NOT IN ('coach','admin')`];
+    const params = [];
+    if (scope === "mine") { params.push(req.user.id); where.push(`u.coach_id = $${params.length}`); }
+    else if (scope === "unattached") where.push(`u.coach_id IS NULL`);
+    else if (scope === "coached") where.push(`u.coach_id IS NOT NULL`);
+    if (optedIn) where.push(`u.marketing_opt_in IS TRUE`);
+    if (q) {
+      params.push(`%${q}%`);
+      where.push(`(LOWER(u.name) LIKE $${params.length} OR LOWER(u.email) LIKE $${params.length})`);
+    }
+    params.push(limit);
+
+    const r = await pool.query(
+      `SELECT u.id, u.name, u.email, u.coach_id, u.active, u.marketing_opt_in,
+              u.signup_source, u.created_at, c.name AS coach_name
+         FROM users u
+         LEFT JOIN users c ON c.id = u.coach_id
+        WHERE ${where.join(" AND ")}
+        ORDER BY u.name ASC
+        LIMIT $${params.length}`,
+      params
+    );
+    return res.json(
+      r.rows.map((x) => ({
+        id: x.id,
+        name: x.name,
+        email: x.email,
+        coachId: x.coach_id,
+        coachName: x.coach_name,
+        active: x.active !== false,
+        marketingOptIn: x.marketing_opt_in === true,
+        signupSource: x.signup_source || "coach",
+        createdAt: x.created_at,
+      }))
+    );
+  } catch (err) {
+    console.error("Directory error:", err);
+    return res.status(500).json({ error: "Could not load the user directory" });
+  }
+});
+
+// Claim a self-signed-up user onto this coach's roster. Only works on an
+// account with no coach — moving someone between coaches stays with the
+// existing transfer endpoint so the handover stays deliberate.
+app.post("/users/:id/claim", requireAuth, requireCoach, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const target = await pool.query(
+      `SELECT id, name, coach_id, role FROM users WHERE id = $1`, [id]
+    );
+    const u = target.rows[0];
+    if (!u || u.role === "coach" || u.role === "admin") {
+      return res.status(404).json({ error: "User not found" });
+    }
+    if (u.coach_id) {
+      return res.status(409).json({ error: "That account already has a coach — use Transfer instead." });
+    }
+    await pool.query(`UPDATE users SET coach_id = $1 WHERE id = $2`, [req.user.id, id]);
+    const coachName = (await pool.query("SELECT name FROM users WHERE id=$1", [req.user.id])).rows[0]?.name || "A coach";
+    sendPushToUser(id, "You have a coach", `${coachName} is now coaching you in No Rule Nutrition.`, { type: "coach-linked" });
+    return res.json({ ok: true, id, coachId: req.user.id });
+  } catch (err) {
+    console.error("Claim user error:", err);
+    return res.status(500).json({ error: "Could not add that account to your roster" });
   }
 });
 
@@ -2484,14 +3042,15 @@ app.post("/messages/broadcast-all", requireAuth, requireAdmin, async (req, res) 
     const msg = content.trim().slice(0, 5000);
     let sent = 0;
     for (const a of athletes.rows) {
-      await pool.query(
-        `WITH ins AS (
-           INSERT INTO messages (from_id, to_id, content, message_type, subject, created_at)
-           VALUES ($1,$2,$3,'broadcast','📢 Announcement',NOW())
-           RETURNING id
-         ) UPDATE messages SET thread_id = ins.id FROM ins WHERE messages.id = ins.id`,
+      // Same two-statement fix as /messages/broadcast — see the note there.
+      const ins = await pool.query(
+        `INSERT INTO messages (from_id, to_id, content, message_type, subject, created_at)
+         VALUES ($1,$2,$3,'broadcast','📢 Announcement',NOW())
+         RETURNING id`,
         [adminId, a.id, msg]
       );
+      const newId = ins.rows[0]?.id;
+      if (newId) await pool.query(`UPDATE messages SET thread_id = $1 WHERE id = $1`, [newId]);
       sent++;
     }
     // Notify all recipients of the admin broadcast (fire-and-forget).
@@ -2802,6 +3361,7 @@ app.get("/messages/:otherId", requireAuth, async (req, res) => {
     let sql = `
       SELECT m.id, m.from_id AS "fromId", m.to_id AS "toId", m.content, m.created_at,
              m.message_type AS "messageType", m.checkin_id AS "checkinId",
+             m.subject, m.thread_id AS "threadId",
              u.name AS "fromName"
        FROM messages m
        LEFT JOIN users u ON u.id = m.from_id
@@ -3605,7 +4165,13 @@ async function ensureCoachVideosTable() {
     try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS created_by INTEGER`); } catch {}
     try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`); } catch {}
     try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS athlete_id INTEGER`); } catch {}
+    // Global content: athlete_id IS NULL + audience tells us who it reaches.
+    // 'all' = every account (self-signups included), 'coached' = anyone with a
+    // coach, 'clients' = only the sending coach's own roster.
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS audience TEXT`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_videos ALTER COLUMN athlete_id DROP NOT NULL`); } catch {}
     try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_coach_videos_athlete ON coach_videos (athlete_id, created_at DESC)`); } catch {}
+    try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_coach_videos_audience ON coach_videos (audience, created_at DESC)`); } catch {}
   } catch (e) { console.error("ensureCoachVideosTable error:", e); }
   coachVideosTableReady = true;
 }
@@ -3632,20 +4198,132 @@ app.get("/coach-videos/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, as
   try {
     await ensureCoachVideosTable();
     const athleteId = Number(req.params.athleteId);
+    // Content aimed at this person, plus global content (athlete_id NULL):
+    //   audience 'all'     → everyone, self-signups included
+    //   audience 'coached' → anyone who has a coach
+    //   audience 'clients' → only the sending coach's own roster
     const result = await pool.query(
       `SELECT cv.id, cv.athlete_id, cv.title, cv.youtube_id, cv.category, cv.notes,
-              cv.created_by, cv.created_at, u.name AS coach_name
+              cv.created_by, cv.created_at, cv.audience, u.name AS coach_name
        FROM coach_videos cv
        LEFT JOIN users u ON u.id = cv.created_by
+       LEFT JOIN users me ON me.id = $1
        WHERE cv.athlete_id = $1
+          OR (cv.athlete_id IS NULL AND (
+                cv.audience = 'all'
+             OR (cv.audience = 'coached' AND me.coach_id IS NOT NULL)
+             OR (cv.audience = 'clients' AND me.coach_id = cv.created_by)
+          ))
        ORDER BY cv.created_at DESC
-       LIMIT 100`,
+       LIMIT 200`,
       [athleteId]
     );
     return res.json(result.rows);
   } catch (err) {
     console.error("Get coach videos error:", err);
     return res.status(500).json({ error: "Could not fetch videos" });
+  }
+});
+
+// Share content (video / PDF / link) with a whole audience in one row, rather
+// than copying it onto every roster. Body: { title, url|youtubeId, category,
+// notes, audience: "all" | "coached" | "clients" }
+app.post("/coach-content/broadcast", requireAuth, requireCoach, async (req, res) => {
+  try {
+    await ensureCoachVideosTable();
+    const { title, url, youtubeId, category, notes } = req.body || {};
+    const audience = ["all", "coached", "clients"].includes(String(req.body?.audience))
+      ? String(req.body.audience)
+      : "all";
+    const ytId = extractYoutubeId(youtubeId || url);
+    if (!ytId) return res.status(400).json({ error: "Invalid YouTube URL or video ID" });
+    if (!title || typeof title !== "string" || !title.trim()) {
+      return res.status(400).json({ error: "Title is required" });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO coach_videos (athlete_id, title, youtube_id, category, notes, created_by, audience, created_at)
+       VALUES (NULL, $1, $2, $3, $4, $5, $6, NOW())
+       RETURNING id, athlete_id, title, youtube_id, category, notes, created_by, audience, created_at`,
+      [
+        String(title).trim().slice(0, 160),
+        ytId,
+        category ? String(category).slice(0, 40) : "General",
+        notes ? String(notes).slice(0, 1000) : null,
+        req.user.id,
+        audience,
+      ]
+    );
+    const row = result.rows[0];
+    const coachName = (await pool.query("SELECT name FROM users WHERE id=$1", [req.user.id])).rows[0]?.name || "Your coach";
+
+    // Who to notify — same rules the GET applies.
+    const audSql =
+      audience === "all"
+        ? `SELECT id FROM users WHERE role NOT IN ('coach','admin') AND COALESCE(active,TRUE)=TRUE`
+        : audience === "coached"
+        ? `SELECT id FROM users WHERE role NOT IN ('coach','admin') AND coach_id IS NOT NULL AND COALESCE(active,TRUE)=TRUE`
+        : `SELECT id FROM users WHERE role NOT IN ('coach','admin') AND coach_id = $1 AND COALESCE(active,TRUE)=TRUE`;
+    const audParams = audience === "clients" ? [req.user.id] : [];
+    const recips = await pool.query(audSql, audParams);
+
+    const catRaw = String(row.category || "");
+    let kind = "a video";
+    if (catRaw.startsWith("type:")) {
+      const t = catRaw.split(":")[1];
+      if (t === "pdf") kind = "a PDF";
+      else if (t === "link") kind = "a link";
+    }
+    sendPushToUsers(
+      recips.rows.map((r) => r.id),
+      `${coachName} shared ${kind}`,
+      row.title,
+      { type: "coach-content", contentId: String(row.id) }
+    );
+
+    return res.status(201).json({ ...row, coach_name: coachName, reached: recips.rows.length });
+  } catch (err) {
+    console.error("Broadcast content error:", err);
+    return res.status(500).json({ error: "Could not share that content" });
+  }
+});
+
+// List and remove global content (the coach's own, or anything if admin).
+app.get("/coach-content/broadcast", requireAuth, requireCoach, async (req, res) => {
+  try {
+    await ensureCoachVideosTable();
+    const isAdmin = req.user.role === "admin";
+    const r = await pool.query(
+      `SELECT cv.id, cv.title, cv.youtube_id, cv.category, cv.notes, cv.audience,
+              cv.created_by, cv.created_at, u.name AS coach_name
+         FROM coach_videos cv
+         LEFT JOIN users u ON u.id = cv.created_by
+        WHERE cv.athlete_id IS NULL ${isAdmin ? "" : "AND cv.created_by = $1"}
+        ORDER BY cv.created_at DESC
+        LIMIT 200`,
+      isAdmin ? [] : [req.user.id]
+    );
+    return res.json(r.rows);
+  } catch (err) {
+    console.error("List broadcast content error:", err);
+    return res.status(500).json({ error: "Could not load shared content" });
+  }
+});
+
+app.delete("/coach-content/broadcast/:id", requireAuth, requireCoach, async (req, res) => {
+  try {
+    await ensureCoachVideosTable();
+    const id = Number(req.params.id);
+    const isAdmin = req.user.role === "admin";
+    await pool.query(
+      `DELETE FROM coach_videos
+        WHERE id = $1 AND athlete_id IS NULL ${isAdmin ? "" : "AND created_by = $2"}`,
+      isAdmin ? [id] : [id, req.user.id]
+    );
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Delete broadcast content error:", err);
+    return res.status(500).json({ error: "Could not remove that content" });
   }
 });
 
@@ -3906,6 +4584,26 @@ app.listen(PORT, async () => {
     try { await pool.query(`ALTER TABLE coach_checkins ADD COLUMN IF NOT EXISTS series_id TEXT`); } catch (_) {}
     try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE`); } catch (_) {}
     try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS step_target INTEGER`); } catch (_) {}
+    try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS sex TEXT`); } catch (_) {}
+    try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS programming_enabled BOOLEAN DEFAULT FALSE`); } catch (_) {}
+    // Self-signup: anyone can create an account without a coach.
+    // marketing_opt_in records the tick box on the signup form; signup_source
+    // tells a self-serve account apart from one a coach created for a client.
+    try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS marketing_opt_in BOOLEAN DEFAULT FALSE`); } catch (_) {}
+    try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS signup_source TEXT`); } catch (_) {}
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS programming (
+        id BIGSERIAL PRIMARY KEY,
+        athlete_id INTEGER NOT NULL,
+        date DATE NOT NULL,
+        body TEXT NOT NULL DEFAULT '',
+        updated_by INTEGER,
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE (athlete_id, date)
+      );
+    `);
+    try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_programming_athlete_date ON programming (athlete_id, date)`); } catch {}
+    try { await pool.query(`ALTER TABLE programming ADD COLUMN IF NOT EXISTS sessions JSONB DEFAULT '[]'`); } catch {}
     await pool.query(`
       CREATE TABLE IF NOT EXISTS measurements (
         id BIGSERIAL PRIMARY KEY,
@@ -4146,6 +4844,10 @@ app.listen(PORT, async () => {
     try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS created_by INTEGER`); } catch {}
     try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`); } catch {}
     try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS athlete_id INTEGER`); } catch {}
+    try { await pool.query(`ALTER TABLE coach_videos ADD COLUMN IF NOT EXISTS audience TEXT`); } catch {}
+    // Global content rows have athlete_id NULL, so that column must be nullable.
+    try { await pool.query(`ALTER TABLE coach_videos ALTER COLUMN athlete_id DROP NOT NULL`); } catch {}
+    try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_coach_videos_audience ON coach_videos (audience, created_at DESC)`); } catch {}
     // Drop any leftover NOT NULL constraints from old schemas (so our new INSERTs work)
     try { await pool.query(`ALTER TABLE coach_videos ALTER COLUMN title DROP NOT NULL`); } catch {}
     try { await pool.query(`ALTER TABLE coach_videos ALTER COLUMN youtube_id DROP NOT NULL`); } catch {}
