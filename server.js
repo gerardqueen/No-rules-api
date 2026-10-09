@@ -2060,29 +2060,6 @@ app.post("/programming/:athleteId/bulk", requireAuth, requireCoach, async (req, 
 // ─────────────────────────────────────────────────────────────────────────────
 const MEASURE_SITES = ["waist", "hips", "chest", "arm", "thigh", "neck", "calf", "shoulders"];
 
-app.get("/measurements/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
-  try {
-    const athleteId = Number(req.params.athleteId);
-    const start = req.query.start ? String(req.query.start) : null;
-    const end = req.query.end ? String(req.query.end) : null;
-    let q = `SELECT date::text AS date, site, cm FROM body_measurements WHERE athlete_id = $1`;
-    const params = [athleteId];
-    if (start) { params.push(start); q += ` AND date >= $${params.length}::date`; }
-    if (end) { params.push(end); q += ` AND date <= $${params.length}::date`; }
-    q += ` ORDER BY date DESC, site ASC`;
-    const r = await pool.query(q, params);
-    // Group into one object per date: { date, sites: { waist: 82, ... } }
-    const byDate = {};
-    r.rows.forEach((row) => {
-      (byDate[row.date] = byDate[row.date] || { date: row.date, sites: {} }).sites[row.site] = Number(row.cm);
-    });
-    return res.json(Object.values(byDate).sort((a, b) => b.date.localeCompare(a.date)));
-  } catch (err) {
-    console.error("Get measurements error:", err);
-    return res.status(500).json({ error: "Could not fetch measurements" });
-  }
-});
-
 // Body: { date: "YYYY-MM-DD", sites: { waist: 82.5, hips: 96 } }
 // A site sent as null/"" removes that entry for the date.
 app.put("/measurements/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
@@ -2162,199 +2139,381 @@ app.get("/step-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async
 });
 
 
-// Set an athlete's sex, which decides the measurement sites offered
-// (e.g. under-bust for women, neck/chest for men). Either the athlete or
-// their coach can set it.
-app.patch("/athletes/:athleteId/sex", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+// ─────────────────────────────────────────────────────────────────────────────
+// BENCHMARKS & TESTS — 1RMs, row times, and any test a coach invents.
+//
+// Two tables:
+//   benchmark_types   what can be tested. coach_id NULL = built-in, available
+//                     to everyone; otherwise it belongs to that coach.
+//   benchmark_results one dated result per athlete per benchmark. Full history
+//                     is kept, so progress can be charted over time.
+//
+// `unit` decides how a value is stored and displayed:
+//   kg | lb | reps | m | cm | watts  → stored as the number itself
+//   time                             → stored as SECONDS (so 2k row 7:12 = 432)
+// `lower_is_better` marks tests where a smaller number is a better result
+// (every time-based test), which decides what counts as a personal best.
+// ─────────────────────────────────────────────────────────────────────────────
+const BENCHMARK_UNITS = ["kg", "lb", "reps", "m", "cm", "watts", "time"];
+
+// Built-in benchmarks, inserted once on boot. Coaches add their own on top.
+const SEED_BENCHMARKS = [
+  // Barbell 1RMs
+  ["Back Squat 1RM", "Strength", "kg", false],
+  ["Front Squat 1RM", "Strength", "kg", false],
+  ["Deadlift 1RM", "Strength", "kg", false],
+  ["Bench Press 1RM", "Strength", "kg", false],
+  ["Strict Press 1RM", "Strength", "kg", false],
+  ["Power Clean 1RM", "Olympic", "kg", false],
+  ["Clean & Jerk 1RM", "Olympic", "kg", false],
+  ["Snatch 1RM", "Olympic", "kg", false],
+  // Rowing
+  ["500m Row", "Rowing", "time", true],
+  ["1k Row", "Rowing", "time", true],
+  ["2k Row", "Rowing", "time", true],
+  ["5k Row", "Rowing", "time", true],
+  ["30min Row", "Rowing", "m", false],
+  // Running / conditioning
+  ["1 Mile Run", "Conditioning", "time", true],
+  ["5k Run", "Conditioning", "time", true],
+  ["Max Pull-Ups", "Bodyweight", "reps", false],
+  ["Max Push-Ups", "Bodyweight", "reps", false],
+];
+
+let benchmarksReady = false;
+async function ensureBenchmarkTables() {
+  if (benchmarksReady) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS benchmark_types (
+      id BIGSERIAL PRIMARY KEY,
+      coach_id INTEGER,
+      name TEXT NOT NULL,
+      category TEXT DEFAULT 'General',
+      unit TEXT NOT NULL DEFAULT 'kg',
+      lower_is_better BOOLEAN DEFAULT FALSE,
+      archived BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS benchmark_results (
+      id BIGSERIAL PRIMARY KEY,
+      athlete_id INTEGER NOT NULL,
+      benchmark_id BIGINT NOT NULL,
+      value NUMERIC NOT NULL,
+      date DATE NOT NULL,
+      notes TEXT,
+      recorded_by INTEGER,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE (athlete_id, benchmark_id, date)
+    );
+  `);
+  try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_benchmark_results_athlete ON benchmark_results (athlete_id, benchmark_id, date DESC)`); } catch {}
+  // A built-in is identified by coach_id IS NULL, so the uniqueness that stops
+  // duplicate seeding on every boot has to be a partial index.
+  try { await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_benchmark_types_builtin ON benchmark_types (name) WHERE coach_id IS NULL`); } catch {}
+  for (const [name, category, unit, lower] of SEED_BENCHMARKS) {
+    try {
+      await pool.query(
+        `INSERT INTO benchmark_types (coach_id, name, category, unit, lower_is_better)
+         VALUES (NULL, $1, $2, $3, $4)
+         ON CONFLICT DO NOTHING`,
+        [name, category, unit, lower]
+      );
+    } catch {}
+  }
+  benchmarksReady = true;
+}
+
+// Which benchmark types a given user may see: the built-ins plus their coach's
+// own (for an athlete) or their own (for a coach).
+async function benchmarkTypesFor(user, athleteId) {
+  let coachId = null;
+  if (user.role === "coach") coachId = user.id;
+  else if (athleteId) {
+    const r = await pool.query(`SELECT coach_id FROM users WHERE id = $1`, [athleteId]);
+    coachId = r.rows[0]?.coach_id || null;
+  }
+  const r = await pool.query(
+    `SELECT id, coach_id, name, category, unit, lower_is_better, archived
+       FROM benchmark_types
+      WHERE archived = FALSE AND (coach_id IS NULL ${coachId ? "OR coach_id = $1" : ""})
+      ORDER BY category ASC, name ASC`,
+    coachId ? [coachId] : []
+  );
+  return r.rows;
+}
+
+app.get("/benchmark-types", requireAuth, async (req, res) => {
   try {
-    const athleteId = Number(req.params.athleteId);
-    const raw = String(req.body?.sex || "").toLowerCase();
-    const sex = ["male", "female", "unspecified"].includes(raw) ? raw : null;
-    if (!sex) return res.status(400).json({ error: "sex must be male, female or unspecified" });
-    await pool.query("UPDATE users SET sex = $1 WHERE id = $2", [sex === "unspecified" ? null : sex, athleteId]);
-    return res.json({ ok: true, sex });
+    await ensureBenchmarkTables();
+    const athleteId = req.query.athleteId ? Number(req.query.athleteId) : req.user.id;
+    const rows = await benchmarkTypesFor(req.user, athleteId);
+    return res.json(rows.map((b) => ({
+      id: Number(b.id),
+      name: b.name,
+      category: b.category || "General",
+      unit: b.unit,
+      lowerIsBetter: b.lower_is_better === true,
+      builtIn: b.coach_id === null,
+    })));
   } catch (err) {
-    console.error("Set sex error:", err);
-    return res.status(500).json({ error: "Could not save" });
+    console.error("Get benchmark types error:", err);
+    return res.status(500).json({ error: "Could not load benchmarks" });
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PROGRAMMING — optional per-athlete training programming. One free-text block
-// per day, written by the coach, read by the athlete. Deliberately simple:
-// the coach types whatever they want (multi-line) and it shows as written.
-// ─────────────────────────────────────────────────────────────────────────────
-app.patch("/athletes/:athleteId/programming-enabled", requireAuth, requireCoach, async (req, res) => {
+// Coaches add their own tests. Built-ins can't be edited, only ignored.
+app.post("/benchmark-types", requireAuth, requireCoach, async (req, res) => {
   try {
-    const athleteId = Number(req.params.athleteId);
-    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
-    if (!ok) return res.status(404).json({ error: "Athlete not found" });
-    const enabled = !!req.body?.enabled;
-    await pool.query("UPDATE users SET programming_enabled = $1 WHERE id = $2", [enabled, athleteId]);
-    return res.json({ ok: true, enabled });
-  } catch (err) {
-    console.error("Toggle programming error:", err);
-    return res.status(500).json({ error: "Could not update programming setting" });
-  }
-});
+    await ensureBenchmarkTables();
+    const name = String(req.body?.name || "").trim();
+    if (name.length < 2) return res.status(400).json({ error: "Give the benchmark a name." });
+    const unit = BENCHMARK_UNITS.includes(String(req.body?.unit)) ? String(req.body.unit) : "kg";
+    const category = String(req.body?.category || "General").slice(0, 40);
+    // Times are always lower-is-better; otherwise trust the flag sent.
+    const lower = unit === "time" ? true : req.body?.lowerIsBetter === true;
 
-app.get("/programming/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
-  try {
-    const athleteId = Number(req.params.athleteId);
-    const start = req.query.start ? String(req.query.start) : null;
-    const end = req.query.end ? String(req.query.end) : null;
-    let q = `SELECT date::text AS date, body, sessions, updated_at FROM programming
-             WHERE athlete_id = $1 AND (body <> '' OR jsonb_array_length(COALESCE(sessions,'[]'::jsonb)) > 0)`;
-    const params = [athleteId];
-    if (start) { params.push(start); q += ` AND date >= $${params.length}::date`; }
-    if (end) { params.push(end); q += ` AND date <= $${params.length}::date`; }
-    q += ` ORDER BY date ASC`;
-    const r = await pool.query(q, params);
-    // Normalise: always hand back a sessions array. Days saved before
-    // multi-session support become a single untitled session.
-    const rows = r.rows.map((row) => {
-      const sess = Array.isArray(row.sessions) ? row.sessions : [];
-      if (sess.length === 0 && row.body) {
-        return { date: row.date, sessions: [{ title: "Session", time: null, body: row.body }], updated_at: row.updated_at };
-      }
-      return { date: row.date, sessions: sess, updated_at: row.updated_at };
+    const dupe = await pool.query(
+      `SELECT id FROM benchmark_types
+        WHERE LOWER(name) = LOWER($1) AND archived = FALSE
+          AND (coach_id IS NULL OR coach_id = $2)`,
+      [name, req.user.id]
+    );
+    if (dupe.rows.length) return res.status(409).json({ error: "A benchmark with that name already exists." });
+
+    const r = await pool.query(
+      `INSERT INTO benchmark_types (coach_id, name, category, unit, lower_is_better)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, coach_id, name, category, unit, lower_is_better`,
+      [req.user.id, name.slice(0, 80), category, unit, lower]
+    );
+    const b = r.rows[0];
+    return res.status(201).json({
+      id: Number(b.id), name: b.name, category: b.category,
+      unit: b.unit, lowerIsBetter: b.lower_is_better === true, builtIn: false,
     });
-    return res.json(rows);
   } catch (err) {
-    console.error("Get programming error:", err);
-    return res.status(500).json({ error: "Could not fetch programming" });
+    console.error("Create benchmark type error:", err);
+    return res.status(500).json({ error: "Could not create that benchmark" });
   }
 });
 
-// Body: { date, body }. An empty body clears that day.
-app.put("/programming/:athleteId", requireAuth, requireCoach, async (req, res) => {
+app.put("/benchmark-types/:id", requireAuth, requireCoach, async (req, res) => {
   try {
+    await ensureBenchmarkTables();
+    const id = Number(req.params.id);
+    const own = await pool.query(`SELECT coach_id FROM benchmark_types WHERE id = $1`, [id]);
+    if (!own.rows.length) return res.status(404).json({ error: "Benchmark not found" });
+    if (own.rows[0].coach_id === null && req.user.role !== "admin") {
+      return res.status(403).json({ error: "Built-in benchmarks can't be edited." });
+    }
+    if (own.rows[0].coach_id !== null && own.rows[0].coach_id !== req.user.id && req.user.role !== "admin") {
+      return res.status(403).json({ error: "That benchmark belongs to another coach." });
+    }
+    const name = req.body?.name !== undefined ? String(req.body.name).trim().slice(0, 80) : null;
+    const category = req.body?.category !== undefined ? String(req.body.category).slice(0, 40) : null;
+    const unit = BENCHMARK_UNITS.includes(String(req.body?.unit)) ? String(req.body.unit) : null;
+    const r = await pool.query(
+      `UPDATE benchmark_types SET
+         name = COALESCE($2, name),
+         category = COALESCE($3, category),
+         unit = COALESCE($4, unit),
+         lower_is_better = CASE WHEN $4 = 'time' THEN TRUE ELSE COALESCE($5, lower_is_better) END
+       WHERE id = $1
+       RETURNING id, name, category, unit, lower_is_better, coach_id`,
+      [id, name || null, category || null, unit, typeof req.body?.lowerIsBetter === "boolean" ? req.body.lowerIsBetter : null]
+    );
+    const b = r.rows[0];
+    return res.json({
+      id: Number(b.id), name: b.name, category: b.category,
+      unit: b.unit, lowerIsBetter: b.lower_is_better === true, builtIn: b.coach_id === null,
+    });
+  } catch (err) {
+    console.error("Update benchmark type error:", err);
+    return res.status(500).json({ error: "Could not update that benchmark" });
+  }
+});
+
+// Archive rather than delete, so existing results keep their label.
+app.delete("/benchmark-types/:id", requireAuth, requireCoach, async (req, res) => {
+  try {
+    await ensureBenchmarkTables();
+    const id = Number(req.params.id);
+    const own = await pool.query(`SELECT coach_id FROM benchmark_types WHERE id = $1`, [id]);
+    if (!own.rows.length) return res.status(404).json({ error: "Benchmark not found" });
+    if (own.rows[0].coach_id === null) return res.status(403).json({ error: "Built-in benchmarks can't be removed." });
+    if (own.rows[0].coach_id !== req.user.id && req.user.role !== "admin") {
+      return res.status(403).json({ error: "That benchmark belongs to another coach." });
+    }
+    await pool.query(`UPDATE benchmark_types SET archived = TRUE WHERE id = $1`, [id]);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Archive benchmark type error:", err);
+    return res.status(500).json({ error: "Could not remove that benchmark" });
+  }
+});
+
+// Every result for an athlete, plus the current best per benchmark — which is
+// what percentage-based programming resolves against.
+app.get("/benchmarks/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    await ensureBenchmarkTables();
     const athleteId = Number(req.params.athleteId);
-    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
-    if (!ok) return res.status(404).json({ error: "Athlete not found" });
-    const date = String(req.body?.date || "");
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: "date (YYYY-MM-DD) required" });
-    // Preferred shape: sessions[]. A plain `body` is still accepted and stored
-    // as one session, so older clients keep working.
-    const rawSessions = Array.isArray(req.body?.sessions) ? req.body.sessions : null;
-    const legacyBody = String(req.body?.body ?? "");
-    const sessions = (rawSessions !== null
-      ? rawSessions
-      : (legacyBody.trim() ? [{ title: "Session", time: null, body: legacyBody }] : [])
-    )
-      .slice(0, 8)
+    const types = await benchmarkTypesFor(req.user, athleteId);
+    const byId = new Map(types.map((t) => [String(t.id), t]));
+
+    const r = await pool.query(
+      `SELECT br.id, br.benchmark_id, br.value, br.date::text AS date, br.notes,
+              br.recorded_by, br.created_at, u.name AS recorded_by_name
+         FROM benchmark_results br
+         LEFT JOIN users u ON u.id = br.recorded_by
+        WHERE br.athlete_id = $1
+        ORDER BY br.date ASC`,
+      [athleteId]
+    );
+
+    const results = r.rows
+      .filter((x) => byId.has(String(x.benchmark_id)))
       .map((x) => ({
-        title: String(x?.title || "Session").slice(0, 60),
-        time: x?.time ? String(x.time).slice(0, 5) : null,
-        body: String(x?.body ?? "").slice(0, 8000),
-      }))
-      .filter((x) => x.body.trim());
+        id: Number(x.id),
+        benchmarkId: Number(x.benchmark_id),
+        value: Number(x.value),
+        date: x.date,
+        notes: x.notes || null,
+        recordedBy: x.recorded_by,
+        recordedByName: x.recorded_by_name || null,
+      }));
 
-    if (sessions.length === 0) {
-      await pool.query("DELETE FROM programming WHERE athlete_id = $1 AND date = $2::date", [athleteId, date]);
-      return res.json({ ok: true, cleared: true });
+    // Best and latest per benchmark. "Best" respects lower_is_better, so a
+    // faster 2k wins and a heavier squat wins.
+    const bests = {};
+    for (const t of types) {
+      const mine = results.filter((x) => x.benchmarkId === Number(t.id));
+      if (!mine.length) continue;
+      const lower = t.lower_is_better === true;
+      const best = mine.reduce((a, b) => {
+        if (a === null) return b;
+        return lower ? (b.value < a.value ? b : a) : (b.value > a.value ? b : a);
+      }, null);
+      const latest = mine[mine.length - 1];
+      bests[String(t.id)] = {
+        benchmarkId: Number(t.id),
+        name: t.name,
+        unit: t.unit,
+        lowerIsBetter: lower,
+        best: best.value,
+        bestDate: best.date,
+        latest: latest.value,
+        latestDate: latest.date,
+        count: mine.length,
+      };
     }
-    await pool.query(
-      `INSERT INTO programming (athlete_id, date, body, sessions, updated_by, updated_at)
-       VALUES ($1, $2::date, '', $3::jsonb, $4, NOW())
-       ON CONFLICT (athlete_id, date)
-       DO UPDATE SET body = '', sessions = EXCLUDED.sessions,
-                     updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
-      [athleteId, date, JSON.stringify(sessions), req.user.id]
-    );
-    return res.json({ ok: true, sessions: sessions.length });
+
+    return res.json({
+      types: types.map((b) => ({
+        id: Number(b.id), name: b.name, category: b.category || "General",
+        unit: b.unit, lowerIsBetter: b.lower_is_better === true, builtIn: b.coach_id === null,
+      })),
+      results,
+      bests,
+    });
   } catch (err) {
-    console.error("Save programming error:", err);
-    return res.status(500).json({ error: "Could not save programming" });
+    console.error("Get benchmarks error:", err);
+    return res.status(500).json({ error: "Could not load benchmark results" });
   }
 });
 
-// Bulk upload: [{date, body}, …] — the hook for a CSV import later.
-app.post("/programming/:athleteId/bulk", requireAuth, requireCoach, async (req, res) => {
+// Record a result. Either the athlete or their coach can log one, and the date
+// is free so historic results can be backfilled.
+app.post("/benchmarks/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
+    await ensureBenchmarkTables();
     const athleteId = Number(req.params.athleteId);
-    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
-    if (!ok) return res.status(404).json({ error: "Athlete not found" });
-    const days = Array.isArray(req.body?.days) ? req.body.days.slice(0, 200) : [];
-    let saved = 0;
-    for (const d of days) {
-      const date = String(d?.date || "");
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
-      const sess = (Array.isArray(d?.sessions) ? d.sessions : (d?.body ? [{ title: "Session", time: null, body: d.body }] : []))
-        .slice(0, 8)
-        .map((x) => ({
-          title: String(x?.title || "Session").slice(0, 60),
-          time: x?.time ? String(x.time).slice(0, 5) : null,
-          body: String(x?.body ?? "").slice(0, 8000),
-        }))
-        .filter((x) => x.body.trim());
-      if (sess.length === 0) continue;
-      await pool.query(
-        `INSERT INTO programming (athlete_id, date, body, sessions, updated_by, updated_at)
-         VALUES ($1, $2::date, '', $3::jsonb, $4, NOW())
-         ON CONFLICT (athlete_id, date)
-         DO UPDATE SET body = '', sessions = EXCLUDED.sessions,
-                       updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
-        [athleteId, date, JSON.stringify(sess), req.user.id]
-      );
-      saved++;
-    }
-    return res.json({ ok: true, saved });
-  } catch (err) {
-    console.error("Bulk programming error:", err);
-    return res.status(500).json({ error: "Could not import programming" });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// BODY MEASUREMENTS — waist, hips, chest etc. in cm. Athlete or coach can log.
-// ─────────────────────────────────────────────────────────────────────────────
-app.get("/measurements/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
-  try {
-    const athleteId = Number(req.params.athleteId);
-    const r = await pool.query(
-      `SELECT date::text AS date, site, cm FROM measurements
-       WHERE athlete_id = $1 ORDER BY date ASC`,
-      [athleteId]
-    );
-    return res.json(r.rows);
-  } catch (err) {
-    console.error("Get measurements error:", err);
-    return res.status(500).json({ error: "Could not fetch measurements" });
-  }
-});
-
-// Body: { date, entries: { waist: 84, hips: 98, ... } } — blank/0 values are skipped.
-app.post("/measurements/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
-  try {
-    const athleteId = Number(req.params.athleteId);
+    const benchmarkId = Number(req.body?.benchmarkId);
     const date = String(req.body?.date || "");
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: "date (YYYY-MM-DD) required" });
-    const entries = req.body?.entries || {};
-    let saved = 0;
-    for (const [siteRaw, valRaw] of Object.entries(entries)) {
-      const site = String(siteRaw).slice(0, 32);
-      const cm = Number(valRaw);
-      if (!site || !Number.isFinite(cm) || cm <= 0 || cm > 400) continue;
-      await pool.query(
-        `INSERT INTO measurements (athlete_id, date, site, cm, updated_at)
-         VALUES ($1, $2::date, $3, $4, NOW())
-         ON CONFLICT (athlete_id, date, site)
-         DO UPDATE SET cm = EXCLUDED.cm, updated_at = NOW()`,
-        [athleteId, date, site, Math.round(cm * 10) / 10]
-      );
-      saved++;
-    }
+    if (!Number.isFinite(benchmarkId)) return res.status(400).json({ error: "benchmarkId is required" });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: "date (YYYY-MM-DD) is required" });
+
+    // The benchmark must be one this athlete can actually see.
+    const types = await benchmarkTypesFor(req.user, athleteId);
+    const type = types.find((t) => Number(t.id) === benchmarkId);
+    if (!type) return res.status(404).json({ error: "Benchmark not found" });
+
+    const value = Number(req.body?.value);
+    if (!Number.isFinite(value) || value <= 0) return res.status(400).json({ error: "Enter a value greater than zero." });
+    if (value > 100000) return res.status(400).json({ error: "That value looks wrong — check the units." });
+
     const r = await pool.query(
-      `SELECT date::text AS date, site, cm FROM measurements WHERE athlete_id = $1 ORDER BY date ASC`,
-      [athleteId]
+      `INSERT INTO benchmark_results (athlete_id, benchmark_id, value, date, notes, recorded_by)
+       VALUES ($1, $2, $3, $4::date, $5, $6)
+       ON CONFLICT (athlete_id, benchmark_id, date)
+       DO UPDATE SET value = EXCLUDED.value, notes = EXCLUDED.notes,
+                     recorded_by = EXCLUDED.recorded_by, created_at = NOW()
+       RETURNING id, benchmark_id, value, date::text AS date, notes`,
+      [
+        athleteId, benchmarkId,
+        Math.round(value * 100) / 100,
+        date,
+        req.body?.notes ? String(req.body.notes).slice(0, 500) : null,
+        req.user.id,
+      ]
     );
-    return res.json({ ok: true, saved, measurements: r.rows });
+    const row = r.rows[0];
+
+    // Tell the athlete when their coach logged it for them.
+    if (req.user.id !== athleteId) {
+      sendPushToUser(
+        athleteId,
+        "New benchmark result",
+        `${type.name}: ${formatBenchmarkValue(Number(row.value), type.unit)}`,
+        { type: "benchmark", benchmarkId: String(benchmarkId) }
+      );
+    }
+
+    return res.status(201).json({
+      id: Number(row.id),
+      benchmarkId: Number(row.benchmark_id),
+      value: Number(row.value),
+      date: row.date,
+      notes: row.notes || null,
+    });
   } catch (err) {
-    console.error("Save measurements error:", err);
-    return res.status(500).json({ error: "Could not save measurements" });
+    console.error("Save benchmark result error:", err);
+    return res.status(500).json({ error: "Could not save that result" });
   }
 });
+
+app.delete("/benchmarks/:athleteId/:id", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    await ensureBenchmarkTables();
+    await pool.query(
+      `DELETE FROM benchmark_results WHERE id = $1 AND athlete_id = $2`,
+      [Number(req.params.id), Number(req.params.athleteId)]
+    );
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Delete benchmark result error:", err);
+    return res.status(500).json({ error: "Could not delete that result" });
+  }
+});
+
+// Shared display helper — kg to one decimal, time as m:ss.
+function formatBenchmarkValue(value, unit) {
+  if (!Number.isFinite(value)) return "—";
+  if (unit === "time") {
+    const total = Math.round(value);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const sec = total % 60;
+    return h > 0
+      ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`
+      : `${m}:${String(sec).padStart(2, "0")}`;
+  }
+  const rounded = Math.round(value * 10) / 10;
+  const n = Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+  return unit === "reps" ? n : `${n}${unit}`;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HABITS (Wellbeing) — coach sets habits per athlete; athlete RAG-rates daily.
@@ -4862,6 +5021,9 @@ app.listen(PORT, async () => {
       }
     } catch (e) { console.warn("coach_videos NOT NULL scan:", e.message); }
     try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_coach_videos_athlete ON coach_videos (athlete_id, created_at DESC)`); } catch {}
+
+    // Benchmarks & tests — creates both tables and seeds the built-in list.
+    try { await ensureBenchmarkTables(); } catch (e) { console.warn("benchmark tables:", e.message); }
 
 console.log("✅ DB ready");
 
