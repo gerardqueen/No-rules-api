@@ -2157,27 +2157,33 @@ app.get("/step-logs/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async
 const BENCHMARK_UNITS = ["kg", "lb", "reps", "m", "cm", "watts", "time"];
 
 // Built-in benchmarks, inserted once on boot. Coaches add their own on top.
+// [name, category, unit, lowerIsBetter, distanceMetres]
+// distance_m is what makes pace derivable: a 2k row time divided by four gives
+// the 500m split, so "{80% 2k Row /500m}" can resolve to a real split.
 const SEED_BENCHMARKS = [
   // Barbell 1RMs
-  ["Back Squat 1RM", "Strength", "kg", false],
-  ["Front Squat 1RM", "Strength", "kg", false],
-  ["Deadlift 1RM", "Strength", "kg", false],
-  ["Bench Press 1RM", "Strength", "kg", false],
-  ["Strict Press 1RM", "Strength", "kg", false],
-  ["Power Clean 1RM", "Olympic", "kg", false],
-  ["Clean & Jerk 1RM", "Olympic", "kg", false],
-  ["Snatch 1RM", "Olympic", "kg", false],
+  ["Back Squat 1RM", "Strength", "kg", false, null],
+  ["Front Squat 1RM", "Strength", "kg", false, null],
+  ["Deadlift 1RM", "Strength", "kg", false, null],
+  ["Bench Press 1RM", "Strength", "kg", false, null],
+  ["Strict Press 1RM", "Strength", "kg", false, null],
+  ["Power Clean 1RM", "Olympic", "kg", false, null],
+  ["Clean & Jerk 1RM", "Olympic", "kg", false, null],
+  ["Snatch 1RM", "Olympic", "kg", false, null],
   // Rowing
-  ["500m Row", "Rowing", "time", true],
-  ["1k Row", "Rowing", "time", true],
-  ["2k Row", "Rowing", "time", true],
-  ["5k Row", "Rowing", "time", true],
-  ["30min Row", "Rowing", "m", false],
+  ["500m Row", "Rowing", "time", true, 500],
+  ["1k Row", "Rowing", "time", true, 1000],
+  ["2k Row", "Rowing", "time", true, 2000],
+  ["5k Row", "Rowing", "time", true, 5000],
+  ["30min Row", "Rowing", "m", false, null],
   // Running / conditioning
-  ["1 Mile Run", "Conditioning", "time", true],
-  ["5k Run", "Conditioning", "time", true],
-  ["Max Pull-Ups", "Bodyweight", "reps", false],
-  ["Max Push-Ups", "Bodyweight", "reps", false],
+  ["1 Mile Run", "Conditioning", "time", true, 1609.34],
+  ["5k Run", "Conditioning", "time", true, 5000],
+  ["10k Run", "Conditioning", "time", true, 10000],
+  ["Half Marathon", "Conditioning", "time", true, 21097.5],
+  ["Marathon", "Conditioning", "time", true, 42195],
+  ["Max Pull-Ups", "Bodyweight", "reps", false, null],
+  ["Max Push-Ups", "Bodyweight", "reps", false, null],
 ];
 
 let benchmarksReady = false;
@@ -2212,14 +2218,25 @@ async function ensureBenchmarkTables() {
   // A built-in is identified by coach_id IS NULL, so the uniqueness that stops
   // duplicate seeding on every boot has to be a partial index.
   try { await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_benchmark_types_builtin ON benchmark_types (name) WHERE coach_id IS NULL`); } catch {}
-  for (const [name, category, unit, lower] of SEED_BENCHMARKS) {
+  // Distance of the test in metres, where it has one. Added separately so a
+  // database seeded before this column existed gets backfilled below.
+  try { await pool.query(`ALTER TABLE benchmark_types ADD COLUMN IF NOT EXISTS distance_m NUMERIC`); } catch {}
+  for (const [name, category, unit, lower, distance] of SEED_BENCHMARKS) {
     try {
       await pool.query(
-        `INSERT INTO benchmark_types (coach_id, name, category, unit, lower_is_better)
-         VALUES (NULL, $1, $2, $3, $4)
+        `INSERT INTO benchmark_types (coach_id, name, category, unit, lower_is_better, distance_m)
+         VALUES (NULL, $1, $2, $3, $4, $5)
          ON CONFLICT DO NOTHING`,
-        [name, category, unit, lower]
+        [name, category, unit, lower, distance]
       );
+      // Backfill the distance on built-ins seeded by an earlier version.
+      if (distance !== null) {
+        await pool.query(
+          `UPDATE benchmark_types SET distance_m = $2
+            WHERE coach_id IS NULL AND name = $1 AND distance_m IS NULL`,
+          [name, distance]
+        );
+      }
     } catch {}
   }
   benchmarksReady = true;
@@ -2235,7 +2252,7 @@ async function benchmarkTypesFor(user, athleteId) {
     coachId = r.rows[0]?.coach_id || null;
   }
   const r = await pool.query(
-    `SELECT id, coach_id, name, category, unit, lower_is_better, archived
+    `SELECT id, coach_id, name, category, unit, lower_is_better, archived, distance_m
        FROM benchmark_types
       WHERE archived = FALSE AND (coach_id IS NULL ${coachId ? "OR coach_id = $1" : ""})
       ORDER BY category ASC, name ASC`,
@@ -2255,6 +2272,7 @@ app.get("/benchmark-types", requireAuth, async (req, res) => {
       category: b.category || "General",
       unit: b.unit,
       lowerIsBetter: b.lower_is_better === true,
+      distanceM: b.distance_m === null || b.distance_m === undefined ? null : Number(b.distance_m),
       builtIn: b.coach_id === null,
     })));
   } catch (err) {
@@ -2273,6 +2291,10 @@ app.post("/benchmark-types", requireAuth, requireCoach, async (req, res) => {
     const category = String(req.body?.category || "General").slice(0, 40);
     // Times are always lower-is-better; otherwise trust the flag sent.
     const lower = unit === "time" ? true : req.body?.lowerIsBetter === true;
+    // Distance only means something for a test covering a fixed distance; it's
+    // what lets a pace (per 500m, per km) be derived from the result.
+    const distRaw = Number(req.body?.distanceM);
+    const distance = Number.isFinite(distRaw) && distRaw > 0 ? Math.min(100000, distRaw) : null;
 
     const dupe = await pool.query(
       `SELECT id FROM benchmark_types
@@ -2283,15 +2305,17 @@ app.post("/benchmark-types", requireAuth, requireCoach, async (req, res) => {
     if (dupe.rows.length) return res.status(409).json({ error: "A benchmark with that name already exists." });
 
     const r = await pool.query(
-      `INSERT INTO benchmark_types (coach_id, name, category, unit, lower_is_better)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, coach_id, name, category, unit, lower_is_better`,
-      [req.user.id, name.slice(0, 80), category, unit, lower]
+      `INSERT INTO benchmark_types (coach_id, name, category, unit, lower_is_better, distance_m)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, coach_id, name, category, unit, lower_is_better, distance_m`,
+      [req.user.id, name.slice(0, 80), category, unit, lower, distance]
     );
     const b = r.rows[0];
     return res.status(201).json({
       id: Number(b.id), name: b.name, category: b.category,
-      unit: b.unit, lowerIsBetter: b.lower_is_better === true, builtIn: false,
+      unit: b.unit, lowerIsBetter: b.lower_is_better === true,
+      distanceM: b.distance_m === null ? null : Number(b.distance_m),
+      builtIn: false,
     });
   } catch (err) {
     console.error("Create benchmark type error:", err);
@@ -2314,20 +2338,25 @@ app.put("/benchmark-types/:id", requireAuth, requireCoach, async (req, res) => {
     const name = req.body?.name !== undefined ? String(req.body.name).trim().slice(0, 80) : null;
     const category = req.body?.category !== undefined ? String(req.body.category).slice(0, 40) : null;
     const unit = BENCHMARK_UNITS.includes(String(req.body?.unit)) ? String(req.body.unit) : null;
+    const distRaw = Number(req.body?.distanceM);
+    const distance = Number.isFinite(distRaw) && distRaw > 0 ? Math.min(100000, distRaw) : null;
     const r = await pool.query(
       `UPDATE benchmark_types SET
          name = COALESCE($2, name),
          category = COALESCE($3, category),
          unit = COALESCE($4, unit),
-         lower_is_better = CASE WHEN $4 = 'time' THEN TRUE ELSE COALESCE($5, lower_is_better) END
+         lower_is_better = CASE WHEN $4 = 'time' THEN TRUE ELSE COALESCE($5, lower_is_better) END,
+         distance_m = COALESCE($6, distance_m)
        WHERE id = $1
-       RETURNING id, name, category, unit, lower_is_better, coach_id`,
-      [id, name || null, category || null, unit, typeof req.body?.lowerIsBetter === "boolean" ? req.body.lowerIsBetter : null]
+       RETURNING id, name, category, unit, lower_is_better, distance_m, coach_id`,
+      [id, name || null, category || null, unit, typeof req.body?.lowerIsBetter === "boolean" ? req.body.lowerIsBetter : null, distance]
     );
     const b = r.rows[0];
     return res.json({
       id: Number(b.id), name: b.name, category: b.category,
-      unit: b.unit, lowerIsBetter: b.lower_is_better === true, builtIn: b.coach_id === null,
+      unit: b.unit, lowerIsBetter: b.lower_is_better === true,
+      distanceM: b.distance_m === null ? null : Number(b.distance_m),
+      builtIn: b.coach_id === null,
     });
   } catch (err) {
     console.error("Update benchmark type error:", err);
@@ -2402,6 +2431,8 @@ app.get("/benchmarks/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, asyn
         name: t.name,
         unit: t.unit,
         lowerIsBetter: lower,
+        // Carried through so the app can turn a whole-test time into a pace.
+        distanceM: t.distance_m === null || t.distance_m === undefined ? null : Number(t.distance_m),
         best: best.value,
         bestDate: best.date,
         latest: latest.value,
@@ -2413,7 +2444,9 @@ app.get("/benchmarks/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, asyn
     return res.json({
       types: types.map((b) => ({
         id: Number(b.id), name: b.name, category: b.category || "General",
-        unit: b.unit, lowerIsBetter: b.lower_is_better === true, builtIn: b.coach_id === null,
+        unit: b.unit, lowerIsBetter: b.lower_is_better === true,
+        distanceM: b.distance_m === null || b.distance_m === undefined ? null : Number(b.distance_m),
+        builtIn: b.coach_id === null,
       })),
       results,
       bests,
