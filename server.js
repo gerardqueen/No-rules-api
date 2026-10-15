@@ -993,7 +993,14 @@ app.get("/macro-plans/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, asy
   }
 });
 
-app.put("/macro-plans/:athleteId", requireAuth, requireCoach, async (req, res) => {
+// Write a weekly macro plan.
+//
+// Coaches and admins set the plan for any athlete on their roster, as before.
+// Since anyone can now open an account without a coach, a self-signup user may
+// also set their OWN targets — but only while they have no coach. The moment a
+// coach picks them up, the coach owns the plan and the athlete's app turns
+// read-only, so a client can never quietly overwrite a coach's programming.
+app.put("/macro-plans/:athleteId", requireAuth, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
     const plans = req.body?.plans;
@@ -1002,8 +1009,49 @@ app.put("/macro-plans/:athleteId", requireAuth, requireCoach, async (req, res) =
       return res.status(400).json({ error: "plans must be an array" });
     }
 
-    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
-    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+    const isStaff = req.user.role === "coach" || req.user.role === "admin";
+    let selfManaged = false;
+
+    if (isStaff) {
+      const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
+      if (!ok) return res.status(404).json({ error: "Athlete not found" });
+    } else {
+      if (req.user.id !== athleteId) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+      const who = await pool.query(`SELECT coach_id FROM users WHERE id = $1`, [athleteId]);
+      if (!who.rows.length) return res.status(404).json({ error: "Account not found" });
+      if (who.rows[0].coach_id) {
+        return res.status(403).json({
+          error: "Your coach sets your targets — message them to have your plan changed.",
+        });
+      }
+      selfManaged = true;
+    }
+
+    // Range check only what a person typed into their own app. Coach writes keep
+    // their existing lenient behaviour so nothing that works today starts failing.
+    if (selfManaged) {
+      for (const p of plans) {
+        const day = String(p.dayOfWeek || "").toUpperCase();
+        if (!VALID_DAYS.includes(day)) continue;
+        const cal = Number(p.calories);
+        const pro = Number(p.protein_g);
+        const carb = Number(p.carbs_g);
+        const fat = Number(p.fat_g);
+        if ([cal, pro, carb, fat].some((n) => !Number.isFinite(n))) {
+          return res.status(400).json({ error: "Enter a number for calories and each macro." });
+        }
+        // 400 is a typo guard, not a recommendation — no adult daily target sits
+        // below it, so a value that low is almost always a mistyped entry.
+        if (cal < 400 || cal > 12000) {
+          return res.status(400).json({ error: "Calories should be between 400 and 12000 — check the figure you entered." });
+        }
+        if ([pro, carb, fat].some((n) => n < 0 || n > 2000)) {
+          return res.status(400).json({ error: "Each macro should be between 0g and 2000g." });
+        }
+      }
+    }
 
     for (const p of plans) {
       const day = String(p.dayOfWeek || "").toUpperCase();
@@ -1031,7 +1079,15 @@ app.put("/macro-plans/:athleteId", requireAuth, requireCoach, async (req, res) =
       );
     }
 
-    return res.json({ ok: true });
+    const saved = await pool.query(
+      `SELECT athlete_id, day_of_week, calories, protein_g, carbs_g, fat_g, updated_by, updated_at
+         FROM macro_plans WHERE athlete_id = $1
+        ORDER BY CASE day_of_week
+          WHEN 'MON' THEN 1 WHEN 'TUE' THEN 2 WHEN 'WED' THEN 3 WHEN 'THU' THEN 4
+          WHEN 'FRI' THEN 5 WHEN 'SAT' THEN 6 WHEN 'SUN' THEN 7 ELSE 8 END`,
+      [athleteId]
+    );
+    return res.json({ ok: true, selfManaged, plans: saved.rows });
   } catch (err) {
     console.error("Bulk update macro plans error:", err);
     return res.status(500).json({ error: "Could not update macro plans" });
@@ -2551,49 +2607,118 @@ function formatBenchmarkValue(value, unit) {
 // ─────────────────────────────────────────────────────────────────────────────
 // HABITS (Wellbeing) — coach sets habits per athlete; athlete RAG-rates daily.
 // ─────────────────────────────────────────────────────────────────────────────
+// Habits are a LIST rather than a single owned plan, so a coach's habits and
+// the athlete's own can sit side by side. created_by records who added each
+// one, and that decides who may remove it: a coach can't delete a habit the
+// athlete set for themselves, and the athlete can't delete the coach's.
+// Admins can remove either.
 app.get("/habits/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
     const result = await pool.query(
-      `SELECT id, title, active, created_at FROM habits
+      `SELECT id, title, active, created_by, created_at FROM habits
        WHERE athlete_id = $1 AND active = TRUE ORDER BY id ASC`,
       [athleteId]
     );
-    return res.json(result.rows);
+    const isStaff = req.user.role === "coach" || req.user.role === "admin";
+    return res.json(
+      result.rows.map((h) => {
+        const owner = h.created_by === null || h.created_by === undefined ? null : Number(h.created_by);
+        return {
+          ...h,
+          // True when the athlete added this one themselves.
+          selfAdded: owner !== null && owner === athleteId,
+          // Who may remove it. A null owner means a habit created before this
+          // column was populated — only a coach could add one back then, so
+          // staff keep the ability to clear it rather than it becoming stuck.
+          canDelete:
+            req.user.role === "admin" ||
+            (owner !== null && owner === req.user.id) ||
+            (owner === null && isStaff),
+        };
+      })
+    );
   } catch (err) {
     console.error("Get habits error:", err);
     return res.status(500).json({ error: "Could not fetch habits" });
   }
 });
 
-app.post("/habits/:athleteId", requireAuth, requireCoach, async (req, res) => {
+app.post("/habits/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
-    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
-    if (!ok) return res.status(404).json({ error: "Athlete not found" });
     const title = String(req.body?.title || "").trim().slice(0, 140);
-    if (!title) return res.status(400).json({ error: "title is required" });
+    if (!title) return res.status(400).json({ error: "Give the habit a name." });
+
+    // Keep the list usable rather than letting it grow without limit.
+    const count = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM habits WHERE athlete_id = $1 AND active = TRUE`,
+      [athleteId]
+    );
+    if ((count.rows[0]?.n || 0) >= 30) {
+      return res.status(400).json({ error: "That's 30 habits already — remove one before adding another." });
+    }
+
+    // Don't silently create a duplicate of something already being tracked.
+    const dupe = await pool.query(
+      `SELECT id FROM habits WHERE athlete_id = $1 AND active = TRUE AND LOWER(title) = LOWER($2)`,
+      [athleteId, title]
+    );
+    if (dupe.rows.length) return res.status(409).json({ error: "You're already tracking that one." });
+
     const result = await pool.query(
       `INSERT INTO habits (athlete_id, title, created_by) VALUES ($1, $2, $3)
-       RETURNING id, title, active, created_at`,
+       RETURNING id, title, active, created_by, created_at`,
       [athleteId, title, req.user.id]
     );
-    return res.status(201).json(result.rows[0]);
+    const h = result.rows[0];
+
+    // Let the athlete know when their coach has added one for them.
+    if (req.user.id !== athleteId) {
+      sendPushToUser(athleteId, "New habit to track", title, { type: "habit" });
+    }
+
+    return res.status(201).json({
+      ...h,
+      selfAdded: Number(h.created_by) === athleteId,
+      canDelete: true,
+    });
   } catch (err) {
     console.error("Create habit error:", err);
     return res.status(500).json({ error: "Could not create habit" });
   }
 });
 
-app.delete("/habits/:athleteId/:id", requireAuth, requireCoach, async (req, res) => {
+app.delete("/habits/:athleteId/:id", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
-    const ok = await coachOrAdminCanAccessAthlete(req.user, athleteId);
-    if (!ok) return res.status(404).json({ error: "Athlete not found" });
+    const id = Number(req.params.id);
+
+    const row = await pool.query(
+      `SELECT created_by FROM habits WHERE athlete_id = $1 AND id = $2 AND active = TRUE`,
+      [athleteId, id]
+    );
+    if (!row.rows.length) return res.status(404).json({ error: "Habit not found" });
+
+    const raw = row.rows[0].created_by;
+    const owner = raw === null || raw === undefined ? null : Number(raw);
+    const isAdmin = req.user.role === "admin";
+    const isStaff = isAdmin || req.user.role === "coach";
+    // A null owner is a legacy coach-created habit (see the GET above).
+    const allowed =
+      isAdmin ||
+      (owner !== null && owner === req.user.id) ||
+      (owner === null && isStaff);
+    if (!allowed) {
+      return res.status(403).json({
+        error: owner === athleteId
+          ? "Your client added this habit themselves — only they can remove it."
+          : "Your coach set this habit. Message them to have it removed.",
+      });
+    }
+
     // Soft-delete so historical ratings keep their context.
-    await pool.query(`UPDATE habits SET active = FALSE WHERE athlete_id = $1 AND id = $2`, [
-      athleteId, Number(req.params.id),
-    ]);
+    await pool.query(`UPDATE habits SET active = FALSE WHERE athlete_id = $1 AND id = $2`, [athleteId, id]);
     return res.json({ ok: true });
   } catch (err) {
     console.error("Delete habit error:", err);
