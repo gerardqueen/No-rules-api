@@ -283,6 +283,13 @@ app.post("/auth/register", async (req, res) => {
     const email = String(req.body?.email || "").toLowerCase().trim();
     const password = String(req.body?.password || "");
     const marketingOptIn = req.body?.marketingOptIn === true || req.body?.marketingOptIn === "true";
+    // What they're here for. Defaults to nutrition only, which is what the app
+    // does out of the box; a coach can change it once they take them on.
+    const wantsProgramming = req.body?.wantsProgramming === true || req.body?.wantsProgramming === "true";
+    let wantsNutrition = req.body?.wantsNutrition === undefined
+      ? true
+      : (req.body.wantsNutrition === true || req.body.wantsNutrition === "true");
+    if (!wantsNutrition && !wantsProgramming) wantsNutrition = true;  // never a blank account
 
     if (!name || name.length < 2) return res.status(400).json({ error: "Please enter your name." });
     if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ error: "Please enter a valid email address." });
@@ -295,10 +302,12 @@ app.post("/auth/register", async (req, res) => {
 
     const hash = await bcrypt.hash(password, 10);
     const ins = await pool.query(
-      `INSERT INTO users (email, password_hash, name, role, coach_id, active, marketing_opt_in, signup_source, created_at)
-       VALUES ($1, $2, $3, 'athlete', NULL, TRUE, $4, 'self', NOW())
-       RETURNING id, email, name, role, sport, mfp_username, coach_id, avatar_url, marketing_opt_in`,
-      [email, hash, name.slice(0, 120), marketingOptIn]
+      `INSERT INTO users (email, password_hash, name, role, coach_id, active, marketing_opt_in,
+                          signup_source, nutrition_enabled, programming_enabled, created_at)
+       VALUES ($1, $2, $3, 'athlete', NULL, TRUE, $4, 'self', $5, $6, NOW())
+       RETURNING id, email, name, role, sport, mfp_username, coach_id, avatar_url,
+                 marketing_opt_in, nutrition_enabled, programming_enabled`,
+      [email, hash, name.slice(0, 120), marketingOptIn, wantsNutrition, wantsProgramming]
     );
     const user = ins.rows[0];
     const token = issueToken(user);
@@ -329,6 +338,8 @@ app.post("/auth/register", async (req, res) => {
         coachId: user.coach_id,
         avatarUrl: user.avatar_url,
         marketingOptIn: user.marketing_opt_in === true,
+        nutritionEnabled: user.nutrition_enabled !== false,
+        programmingEnabled: user.programming_enabled === true,
       },
     });
   } catch (err) {
@@ -391,6 +402,8 @@ app.post("/auth/login", async (req, res) => {
         coachId: user.coach_id,
         avatarUrl: user.avatar_url,
         marketingOptIn: user.marketing_opt_in === true,
+        nutritionEnabled: user.nutrition_enabled !== false,
+        programmingEnabled: user.programming_enabled === true,
       },
     });
   } catch (err) {
@@ -494,7 +507,9 @@ app.get("/auth/me", requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT u.id, u.email, u.name, u.role, u.sport, u.mfp_username, u.coach_id,
-              u.avatar_url, u.sex, u.programming_enabled, u.marketing_opt_in, u.signup_source,
+              u.avatar_url, u.sex, u.programming_enabled,
+              COALESCE(u.nutrition_enabled, TRUE) AS nutrition_enabled,
+              u.marketing_opt_in, u.signup_source,
               c.name AS coach_name
          FROM users u
          LEFT JOIN users c ON c.id = u.coach_id
@@ -517,6 +532,7 @@ app.get("/auth/me", requireAuth, async (req, res) => {
       avatarUrl: user.avatar_url,
       sex: user.sex || null,
       programmingEnabled: user.programming_enabled === true,
+      nutritionEnabled: user.nutrition_enabled !== false,
       marketingOptIn: user.marketing_opt_in === true,
       signupSource: user.signup_source || "coach",
     });
@@ -579,7 +595,8 @@ async function requireSelfOrCoachOfAthlete(req, res, next) {
 app.get("/athletes", requireAuth, requireCoach, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, email, name, role, sport, mfp_username, avatar_url, active, sex, programming_enabled, created_at
+      `SELECT id, email, name, role, sport, mfp_username, avatar_url, active, sex,
+              programming_enabled, COALESCE(nutrition_enabled, TRUE) AS nutrition_enabled, created_at
        FROM users
        WHERE coach_id = $1 AND role NOT IN ('coach','admin')
        ORDER BY name ASC`,
@@ -2003,6 +2020,62 @@ app.patch("/athletes/:athleteId/programming-enabled", requireAuth, requireCoach,
   }
 });
 
+// Set which services an account is signed up for: nutrition, programming, or
+// both. A coach owns this for anyone on their roster, since it reflects what
+// the client is paying for. A self-signup with no coach sets their own, which
+// is how they tell a coach what they're after before being picked up.
+//
+// Body: { nutrition: bool, programming: bool } — either may be omitted to
+// leave that one as it is.
+app.patch("/athletes/:athleteId/services", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    const athleteId = Number(req.params.athleteId);
+    const isStaff = req.user.role === "coach" || req.user.role === "admin";
+
+    if (!isStaff) {
+      const who = await pool.query(`SELECT coach_id FROM users WHERE id = $1`, [athleteId]);
+      if (!who.rows.length) return res.status(404).json({ error: "Account not found" });
+      if (who.rows[0].coach_id) {
+        return res.status(403).json({
+          error: "Your coach sets which services you're on — message them to change it.",
+        });
+      }
+    }
+
+    const cur = await pool.query(
+      `SELECT COALESCE(nutrition_enabled, TRUE) AS n, COALESCE(programming_enabled, FALSE) AS p
+         FROM users WHERE id = $1`,
+      [athleteId]
+    );
+    if (!cur.rows.length) return res.status(404).json({ error: "Account not found" });
+
+    const nutrition = typeof req.body?.nutrition === "boolean" ? req.body.nutrition : cur.rows[0].n === true;
+    const programming = typeof req.body?.programming === "boolean" ? req.body.programming : cur.rows[0].p === true;
+
+    // An account with neither service has nothing to be coached on, and the
+    // coach view would have no tabs at all.
+    if (!nutrition && !programming) {
+      return res.status(400).json({ error: "Pick at least one — nutrition, programming, or both." });
+    }
+
+    await pool.query(
+      `UPDATE users SET nutrition_enabled = $1, programming_enabled = $2 WHERE id = $3`,
+      [nutrition, programming, athleteId]
+    );
+
+    // Tell the client when their coach changes what they're on.
+    if (req.user.id !== athleteId) {
+      const label = nutrition && programming ? "nutrition and programming" : nutrition ? "nutrition" : "programming";
+      sendPushToUser(athleteId, "Your plan was updated", `You're now set up for ${label}.`, { type: "services" });
+    }
+
+    return res.json({ ok: true, nutrition, programming });
+  } catch (err) {
+    console.error("Update services error:", err);
+    return res.status(500).json({ error: "Could not update services" });
+  }
+});
+
 app.get("/programming/:athleteId", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
   try {
     const athleteId = Number(req.params.athleteId);
@@ -3291,7 +3364,10 @@ app.get("/users/directory", requireAuth, requireCoach, async (req, res) => {
 
     const r = await pool.query(
       `SELECT u.id, u.name, u.email, u.coach_id, u.active, u.marketing_opt_in,
-              u.signup_source, u.created_at, c.name AS coach_name
+              u.signup_source, u.created_at,
+              COALESCE(u.nutrition_enabled, TRUE) AS nutrition_enabled,
+              u.programming_enabled,
+              c.name AS coach_name
          FROM users u
          LEFT JOIN users c ON c.id = u.coach_id
         WHERE ${where.join(" AND ")}
@@ -3308,6 +3384,8 @@ app.get("/users/directory", requireAuth, requireCoach, async (req, res) => {
         coachName: x.coach_name,
         active: x.active !== false,
         marketingOptIn: x.marketing_opt_in === true,
+        nutritionEnabled: x.nutrition_enabled !== false,
+        programmingEnabled: x.programming_enabled === true,
         signupSource: x.signup_source || "coach",
         createdAt: x.created_at,
       }))
@@ -4436,22 +4514,391 @@ app.get("/off/search", requireAuth, async (req, res) => {
   try {
     const q = String(req.query.q || "").trim();
     if (q.length < 2) return res.json({ products: [] });
-    // Prefer UK region for UK-centric product names; fall back to world if no results
-    const ukUrl = `https://uk.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=20&fields=code,product_name,product_name_en,brands,nutriments,image_front_small_url,serving_size,serving_quantity,quantity,product_quantity,product_quantity_unit,categories_tags`;
-    const worldUrl = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=20&fields=code,product_name,product_name_en,brands,nutriments,image_front_small_url,serving_size,serving_quantity,quantity,product_quantity,product_quantity_unit,categories_tags`;
-    let data = null;
-    try { data = await fetchJson(ukUrl); } catch (_) {}
-    let products = Array.isArray(data?.products) ? data.products : [];
-    let mapped = products.map(offProductToFood).filter((p) => p && p.calories > 0);
-    if (mapped.length === 0) {
-      try { data = await fetchJson(worldUrl); } catch (_) {}
-      products = Array.isArray(data?.products) ? data.products : [];
-      mapped = products.map(offProductToFood).filter((p) => p && p.calories > 0);
-    }
-    return res.json({ products: mapped });
+    const FIELDS = "code,product_name,product_name_en,brands,nutriments,image_front_small_url,serving_size,serving_quantity,quantity,product_quantity,product_quantity_unit,categories_tags";
+
+    // OFF's simple search matches product NAMES only, so typing a chain —
+    // "Nando's", "Greggs" — returned little or nothing even where that brand
+    // has products in the database. We now run a brand-field query alongside
+    // the name query and merge, which is what makes a brand name behave the
+    // way anyone would expect.
+    const nameUrl = (host) =>
+      `https://${host}.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q)}` +
+      `&search_simple=1&action=process&json=1&page_size=20&fields=${FIELDS}`;
+    const brandUrl = (host) =>
+      `https://${host}.openfoodfacts.org/cgi/search.pl?action=process&json=1&page_size=40&fields=${FIELDS}` +
+      `&tagtype_0=brands&tag_contains_0=contains&tag_0=${encodeURIComponent(q)}` +
+      `&sort_by=unique_scans_n`;
+
+    const gather = async (host) => {
+      const [byName, byBrand] = await Promise.all([
+        fetchJson(nameUrl(host)).catch(() => null),
+        fetchJson(brandUrl(host)).catch(() => null),
+      ]);
+      const rows = [
+        ...(Array.isArray(byBrand?.products) ? byBrand.products : []),
+        ...(Array.isArray(byName?.products) ? byName.products : []),
+      ];
+      // Brand hits lead, because someone typing a chain name wants that chain.
+      const seen = new Set();
+      const out = [];
+      for (const r of rows) {
+        const mappedOne = offProductToFood(r);
+        if (!mappedOne || !(mappedOne.calories > 0)) continue;
+        const key = String(mappedOne.barcode || mappedOne.name || "").toLowerCase();
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        out.push(mappedOne);
+      }
+      return out;
+    };
+
+    // UK first for UK product names, world as a fallback.
+    let mapped = await gather("uk");
+    if (mapped.length === 0) mapped = await gather("world");
+    return res.json({ products: mapped.slice(0, 40) });
   } catch (err) {
     console.error("OFF search error:", err.message);
     return res.json({ products: [], error: "OpenFoodFacts unavailable" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RESTAURANTS & MENUS — eating-out data this platform holds itself.
+//
+// Open Food Facts is organised around barcodes, so it covers packaged retail
+// products well and counter-served menu items hardly at all: a Wetherspoons
+// burger has no barcode and never will. This is where those menus live.
+//
+// Nothing is scraped into here. Rows arrive one of three ways:
+//   • bulk import, once a chain has given permission to use their figures
+//   • a user adding an item they ate, which is how most of it will fill up
+//   • a coach curating items for their clients
+//
+// `source` records where a row came from and `verified` whether it has been
+// checked, so a user's best guess is never mistaken for an official figure.
+// ─────────────────────────────────────────────────────────────────────────────
+let restaurantsReady = false;
+async function ensureRestaurantTables() {
+  if (restaurantsReady) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS restaurants (
+      id BIGSERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      slug TEXT NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'restaurant',
+      country TEXT DEFAULT 'GB',
+      source TEXT,
+      attribution TEXT,
+      active BOOLEAN DEFAULT TRUE,
+      created_by INTEGER,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS restaurant_items (
+      id BIGSERIAL PRIMARY KEY,
+      restaurant_id BIGINT NOT NULL,
+      name TEXT NOT NULL,
+      category TEXT DEFAULT 'General',
+      calories NUMERIC NOT NULL DEFAULT 0,
+      protein_g NUMERIC NOT NULL DEFAULT 0,
+      carbs_g NUMERIC NOT NULL DEFAULT 0,
+      fat_g NUMERIC NOT NULL DEFAULT 0,
+      serving_label TEXT DEFAULT 'serving',
+      serving_g NUMERIC,
+      source TEXT,
+      verified BOOLEAN DEFAULT FALSE,
+      created_by INTEGER,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  try { await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_restaurants_slug ON restaurants (slug)`); } catch {}
+  try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_restaurant_items_rest ON restaurant_items (restaurant_id, category, name)`); } catch {}
+  // One row per item name per brand, so a repeat import updates rather than duplicates.
+  try { await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_restaurant_items_unique ON restaurant_items (restaurant_id, LOWER(name))`); } catch {}
+  restaurantsReady = true;
+}
+
+// Straight and curly apostrophes both stripped, so "Nando's" and "Nando’s"
+// land on the same slug.
+function slugify(name) {
+  return String(name || "")
+    .toLowerCase()
+    .replace(/['’]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+}
+
+// Brands, with how many items each has. ?q= filters by name.
+app.get("/restaurants", requireAuth, async (req, res) => {
+  try {
+    await ensureRestaurantTables();
+    const q = String(req.query.q || "").trim().toLowerCase();
+    const params = [];
+    let where = "r.active = TRUE";
+    if (q) {
+      params.push(`%${q}%`);
+      where += ` AND (LOWER(r.name) LIKE $1 OR r.slug LIKE $1)`;
+    }
+    const r = await pool.query(
+      `SELECT r.id, r.name, r.slug, r.kind, r.attribution,
+              COUNT(i.id)::int AS item_count
+         FROM restaurants r
+         LEFT JOIN restaurant_items i ON i.restaurant_id = r.id
+        WHERE ${where}
+        GROUP BY r.id
+        ORDER BY COUNT(i.id) DESC, r.name ASC
+        LIMIT 50`,
+      params
+    );
+    return res.json(
+      r.rows.map((x) => ({
+        id: Number(x.id),
+        name: x.name,
+        slug: x.slug,
+        kind: x.kind,
+        attribution: x.attribution || null,
+        itemCount: x.item_count,
+      }))
+    );
+  } catch (err) {
+    console.error("List restaurants error:", err);
+    return res.status(500).json({ error: "Could not load restaurants" });
+  }
+});
+
+// Create a brand. Coach/admin only — the brand list is shared by everyone, so
+// it shouldn't fill up with duplicates and typos from every user.
+app.post("/restaurants", requireAuth, requireCoach, async (req, res) => {
+  try {
+    await ensureRestaurantTables();
+    const name = String(req.body?.name || "").trim();
+    if (name.length < 2) return res.status(400).json({ error: "Give the place a name." });
+    const slug = slugify(name);
+    if (!slug) return res.status(400).json({ error: "That name can't be used." });
+    const kind = req.body?.kind === "retailer" ? "retailer" : "restaurant";
+
+    const existing = await pool.query(`SELECT id FROM restaurants WHERE slug = $1`, [slug]);
+    if (existing.rows.length) {
+      return res.status(409).json({ error: "That one already exists.", id: Number(existing.rows[0].id) });
+    }
+    const r = await pool.query(
+      `INSERT INTO restaurants (name, slug, kind, country, source, attribution, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       RETURNING id, name, slug, kind, attribution`,
+      [
+        name.slice(0, 80), slug, kind,
+        String(req.body?.country || "GB").slice(0, 2).toUpperCase(),
+        req.body?.source ? String(req.body.source).slice(0, 80) : null,
+        req.body?.attribution ? String(req.body.attribution).slice(0, 200) : null,
+        req.user.id,
+      ]
+    );
+    const b = r.rows[0];
+    return res.status(201).json({
+      id: Number(b.id), name: b.name, slug: b.slug, kind: b.kind,
+      attribution: b.attribution || null, itemCount: 0,
+    });
+  } catch (err) {
+    console.error("Create restaurant error:", err);
+    return res.status(500).json({ error: "Could not add that place" });
+  }
+});
+
+// A brand's menu, grouped by category on the client. ?q= filters within it.
+app.get("/restaurants/:id/items", requireAuth, async (req, res) => {
+  try {
+    await ensureRestaurantTables();
+    const id = Number(req.params.id);
+    const q = String(req.query.q || "").trim().toLowerCase();
+    const brand = await pool.query(
+      `SELECT id, name, slug, kind, attribution FROM restaurants WHERE id = $1 AND active = TRUE`,
+      [id]
+    );
+    if (!brand.rows.length) return res.status(404).json({ error: "Not found" });
+
+    const params = [id];
+    let where = "restaurant_id = $1";
+    if (q) { params.push(`%${q}%`); where += ` AND LOWER(name) LIKE $2`; }
+
+    const r = await pool.query(
+      `SELECT id, name, category, calories, protein_g, carbs_g, fat_g,
+              serving_label, serving_g, source, verified, created_by
+         FROM restaurant_items
+        WHERE ${where}
+        ORDER BY category ASC, name ASC
+        LIMIT 600`,
+      params
+    );
+    const b = brand.rows[0];
+    return res.json({
+      restaurant: {
+        id: Number(b.id), name: b.name, slug: b.slug, kind: b.kind,
+        attribution: b.attribution || null,
+      },
+      items: r.rows.map((x) => ({
+        id: Number(x.id),
+        name: x.name,
+        category: x.category || "General",
+        calories: Number(x.calories),
+        protein: Number(x.protein_g),
+        carbs: Number(x.carbs_g),
+        fat: Number(x.fat_g),
+        servingLabel: x.serving_label || "serving",
+        servingG: x.serving_g === null ? null : Number(x.serving_g),
+        source: x.source || null,
+        verified: x.verified === true,
+        canDelete: req.user.role === "admin" || Number(x.created_by) === req.user.id,
+      })),
+    });
+  } catch (err) {
+    console.error("Get restaurant items error:", err);
+    return res.status(500).json({ error: "Could not load that menu" });
+  }
+});
+
+// Add one item. Any signed-in user may contribute what they ate; only staff
+// submissions are marked verified.
+app.post("/restaurants/:id/items", requireAuth, async (req, res) => {
+  try {
+    await ensureRestaurantTables();
+    const id = Number(req.params.id);
+    const exists = await pool.query(`SELECT id FROM restaurants WHERE id = $1 AND active = TRUE`, [id]);
+    if (!exists.rows.length) return res.status(404).json({ error: "Not found" });
+
+    const name = String(req.body?.name || "").trim();
+    if (name.length < 2) return res.status(400).json({ error: "Give the item a name." });
+
+    const num = (v) => {
+      const n = Number(v);
+      return Number.isFinite(n) && n >= 0 ? n : NaN;
+    };
+    const calories = num(req.body?.calories);
+    const protein = num(req.body?.protein ?? 0);
+    const carbs = num(req.body?.carbs ?? 0);
+    const fat = num(req.body?.fat ?? 0);
+    if ([calories, protein, carbs, fat].some((n) => Number.isNaN(n))) {
+      return res.status(400).json({ error: "Calories and macros must be numbers." });
+    }
+    if (calories > 10000 || [protein, carbs, fat].some((n) => n > 2000)) {
+      return res.status(400).json({ error: "Those figures look wrong — check them." });
+    }
+
+    const isStaff = req.user.role === "coach" || req.user.role === "admin";
+    const r = await pool.query(
+      `INSERT INTO restaurant_items
+         (restaurant_id, name, category, calories, protein_g, carbs_g, fat_g,
+          serving_label, serving_g, source, verified, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       ON CONFLICT (restaurant_id, LOWER(name)) DO UPDATE SET
+         category = EXCLUDED.category,
+         calories = EXCLUDED.calories,
+         protein_g = EXCLUDED.protein_g,
+         carbs_g = EXCLUDED.carbs_g,
+         fat_g = EXCLUDED.fat_g,
+         serving_label = EXCLUDED.serving_label,
+         serving_g = EXCLUDED.serving_g,
+         source = EXCLUDED.source,
+         verified = EXCLUDED.verified
+       RETURNING id, name, category, calories, protein_g, carbs_g, fat_g,
+                 serving_label, serving_g, verified`,
+      [
+        id, name.slice(0, 140),
+        String(req.body?.category || "General").slice(0, 40),
+        calories, protein, carbs, fat,
+        String(req.body?.servingLabel || "serving").slice(0, 40),
+        Number.isFinite(Number(req.body?.servingG)) && Number(req.body.servingG) > 0
+          ? Number(req.body.servingG) : null,
+        isStaff ? (req.body?.source ? String(req.body.source).slice(0, 80) : "coach") : "user",
+        isStaff,
+        req.user.id,
+      ]
+    );
+    const x = r.rows[0];
+    return res.status(201).json({
+      id: Number(x.id), name: x.name, category: x.category,
+      calories: Number(x.calories), protein: Number(x.protein_g),
+      carbs: Number(x.carbs_g), fat: Number(x.fat_g),
+      servingLabel: x.serving_label, servingG: x.serving_g === null ? null : Number(x.serving_g),
+      verified: x.verified === true, canDelete: true,
+    });
+  } catch (err) {
+    console.error("Add restaurant item error:", err);
+    return res.status(500).json({ error: "Could not add that item" });
+  }
+});
+
+// Bulk import a menu — the hook for data a chain has given permission for.
+// Body: { items: [{ name, category, calories, protein, carbs, fat,
+//                   servingLabel, servingG }], source }
+app.post("/restaurants/:id/items/bulk", requireAuth, requireCoach, async (req, res) => {
+  try {
+    await ensureRestaurantTables();
+    const id = Number(req.params.id);
+    const exists = await pool.query(`SELECT id FROM restaurants WHERE id = $1`, [id]);
+    if (!exists.rows.length) return res.status(404).json({ error: "Not found" });
+
+    const items = Array.isArray(req.body?.items) ? req.body.items.slice(0, 2000) : [];
+    if (!items.length) return res.status(400).json({ error: "No items to import." });
+    const source = req.body?.source ? String(req.body.source).slice(0, 80) : "import";
+
+    let saved = 0, skipped = 0;
+    for (const it of items) {
+      const name = String(it?.name || "").trim();
+      const cal = Number(it?.calories);
+      if (name.length < 2 || !Number.isFinite(cal) || cal < 0 || cal > 10000) { skipped++; continue; }
+      const n = (v) => {
+        const x = Number(v);
+        return Number.isFinite(x) && x >= 0 && x <= 2000 ? x : 0;
+      };
+      await pool.query(
+        `INSERT INTO restaurant_items
+           (restaurant_id, name, category, calories, protein_g, carbs_g, fat_g,
+            serving_label, serving_g, source, verified, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,TRUE,$11)
+         ON CONFLICT (restaurant_id, LOWER(name)) DO UPDATE SET
+           category = EXCLUDED.category, calories = EXCLUDED.calories,
+           protein_g = EXCLUDED.protein_g, carbs_g = EXCLUDED.carbs_g,
+           fat_g = EXCLUDED.fat_g, serving_label = EXCLUDED.serving_label,
+           serving_g = EXCLUDED.serving_g, source = EXCLUDED.source, verified = TRUE`,
+        [
+          id, name.slice(0, 140),
+          String(it?.category || "General").slice(0, 40),
+          cal, n(it?.protein), n(it?.carbs), n(it?.fat),
+          String(it?.servingLabel || "serving").slice(0, 40),
+          Number.isFinite(Number(it?.servingG)) && Number(it.servingG) > 0 ? Number(it.servingG) : null,
+          source, req.user.id,
+        ]
+      );
+      saved++;
+    }
+    return res.json({ ok: true, saved, skipped });
+  } catch (err) {
+    console.error("Bulk import menu error:", err);
+    return res.status(500).json({ error: "Could not import that menu" });
+  }
+});
+
+app.delete("/restaurants/:id/items/:itemId", requireAuth, async (req, res) => {
+  try {
+    await ensureRestaurantTables();
+    const id = Number(req.params.id);
+    const itemId = Number(req.params.itemId);
+    const row = await pool.query(
+      `SELECT created_by FROM restaurant_items WHERE id = $1 AND restaurant_id = $2`,
+      [itemId, id]
+    );
+    if (!row.rows.length) return res.status(404).json({ error: "Item not found" });
+    const isAdmin = req.user.role === "admin";
+    if (!isAdmin && Number(row.rows[0].created_by) !== req.user.id) {
+      return res.status(403).json({ error: "You can only remove items you added." });
+    }
+    await pool.query(`DELETE FROM restaurant_items WHERE id = $1 AND restaurant_id = $2`, [itemId, id]);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Delete restaurant item error:", err);
+    return res.status(500).json({ error: "Could not remove that item" });
   }
 });
 
@@ -4908,6 +5355,12 @@ app.listen(PORT, async () => {
     // tells a self-serve account apart from one a coach created for a client.
     try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS marketing_opt_in BOOLEAN DEFAULT FALSE`); } catch (_) {}
     try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS signup_source TEXT`); } catch (_) {}
+    // Services a client is signed up for. Nutrition defaults ON because the
+    // platform has always been nutrition-first — every existing client keeps
+    // exactly what they have. programming_enabled already exists and stays OFF
+    // by default. Together these decide which tabs a coach sees for a client.
+    try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS nutrition_enabled BOOLEAN DEFAULT TRUE`); } catch (_) {}
+    try { await pool.query(`UPDATE users SET nutrition_enabled = TRUE WHERE nutrition_enabled IS NULL`); } catch (_) {}
     await pool.query(`
       CREATE TABLE IF NOT EXISTS programming (
         id BIGSERIAL PRIMARY KEY,
@@ -5182,6 +5635,9 @@ app.listen(PORT, async () => {
 
     // Benchmarks & tests — creates both tables and seeds the built-in list.
     try { await ensureBenchmarkTables(); } catch (e) { console.warn("benchmark tables:", e.message); }
+
+    // Restaurants & menus — eating-out data held here rather than in OFF.
+    try { await ensureRestaurantTables(); } catch (e) { console.warn("restaurant tables:", e.message); }
 
 console.log("✅ DB ready");
 
