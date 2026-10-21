@@ -4568,6 +4568,13 @@ app.get("/off/search", requireAuth, async (req, res) => {
 // URL can be swapped, or the whole item retired once beta ends, from the
 // server rather than through TestFlight.
 // ─────────────────────────────────────────────────────────────────────────────
+// The beta bug & suggestion form. Set here so a fresh deploy has it without
+// anyone calling the settings endpoint; FEEDBACK_URL overrides it, and an
+// admin can change it at runtime through PATCH /app-settings.
+const DEFAULT_FEEDBACK_URL =
+  process.env.FEEDBACK_URL ||
+  "https://docs.google.com/forms/d/e/1FAIpQLSdFlL4e7Y8394X0LCF75htGXneovGqPNpgqkM0rsos1npcaZA/viewform";
+
 let appSettingsReady = false;
 async function ensureAppSettings() {
   if (appSettingsReady) return;
@@ -4579,13 +4586,40 @@ async function ensureAppSettings() {
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
-  // Seeded empty and off, so nothing shows until a real form URL is set.
-  for (const [k, v] of [["feedback_url", ""], ["feedback_enabled", "false"]]) {
+  for (const [k, v] of [
+    ["feedback_url", DEFAULT_FEEDBACK_URL],
+    ["feedback_enabled", DEFAULT_FEEDBACK_URL ? "true" : "false"],
+  ]) {
     try {
       await pool.query(
         `INSERT INTO app_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING`,
         [k, v]
       );
+    } catch {}
+  }
+
+  // A database seeded by the earlier build already holds these rows as blank
+  // and off, and ON CONFLICT DO NOTHING won't touch them — so fill them once.
+  // The marker makes it exactly once: clearing the URL later to switch the
+  // feature off stays cleared across redeploys instead of being undone.
+  if (DEFAULT_FEEDBACK_URL) {
+    try {
+      const seeded = await pool.query(`SELECT 1 FROM app_settings WHERE key = 'feedback_url_seeded'`);
+      if (!seeded.rows.length) {
+        await pool.query(
+          `UPDATE app_settings SET value = $1, updated_at = NOW()
+            WHERE key = 'feedback_url' AND COALESCE(value, '') = ''`,
+          [DEFAULT_FEEDBACK_URL]
+        );
+        await pool.query(
+          `UPDATE app_settings SET value = 'true', updated_at = NOW()
+            WHERE key = 'feedback_enabled' AND COALESCE(value, '') IN ('', 'false')`
+        );
+        await pool.query(
+          `INSERT INTO app_settings (key, value) VALUES ('feedback_url_seeded', '1')
+           ON CONFLICT (key) DO NOTHING`
+        );
+      }
     } catch {}
   }
   appSettingsReady = true;
