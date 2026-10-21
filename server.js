@@ -4563,6 +4563,283 @@ app.get("/off/search", requireAuth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// APP SETTINGS — small key/value store for things that must be changeable
+// without shipping a new build. The beta feedback link lives here so the form
+// URL can be swapped, or the whole item retired once beta ends, from the
+// server rather than through TestFlight.
+// ─────────────────────────────────────────────────────────────────────────────
+let appSettingsReady = false;
+async function ensureAppSettings() {
+  if (appSettingsReady) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT,
+      updated_by INTEGER,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  // Seeded empty and off, so nothing shows until a real form URL is set.
+  for (const [k, v] of [["feedback_url", ""], ["feedback_enabled", "false"]]) {
+    try {
+      await pool.query(
+        `INSERT INTO app_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING`,
+        [k, v]
+      );
+    } catch {}
+  }
+  appSettingsReady = true;
+}
+
+const PUBLIC_SETTING_KEYS = ["feedback_url", "feedback_enabled"];
+
+app.get("/app-settings", requireAuth, async (_req, res) => {
+  try {
+    await ensureAppSettings();
+    const r = await pool.query(
+      `SELECT key, value FROM app_settings WHERE key = ANY($1::text[])`,
+      [PUBLIC_SETTING_KEYS]
+    );
+    const out = {};
+    for (const row of r.rows) out[row.key] = row.value;
+    return res.json({
+      feedbackUrl: out.feedback_url || "",
+      feedbackEnabled: String(out.feedback_enabled) === "true" && !!(out.feedback_url || "").trim(),
+    });
+  } catch (err) {
+    console.error("Get app settings error:", err);
+    // Never block the app on settings — fall back to the feature being off.
+    return res.json({ feedbackUrl: "", feedbackEnabled: false });
+  }
+});
+
+app.patch("/app-settings", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    await ensureAppSettings();
+    const updates = {};
+    if (typeof req.body?.feedbackUrl === "string") {
+      const u = req.body.feedbackUrl.trim().slice(0, 1000);
+      if (u && !/^https:\/\//i.test(u)) {
+        return res.status(400).json({ error: "The feedback link must start with https://" });
+      }
+      updates.feedback_url = u;
+    }
+    if (typeof req.body?.feedbackEnabled === "boolean") {
+      updates.feedback_enabled = req.body.feedbackEnabled ? "true" : "false";
+    }
+    if (!Object.keys(updates).length) return res.status(400).json({ error: "Nothing to update" });
+
+    for (const [k, v] of Object.entries(updates)) {
+      await pool.query(
+        `INSERT INTO app_settings (key, value, updated_by, updated_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value,
+           updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+        [k, v, req.user.id]
+      );
+    }
+    const r = await pool.query(
+      `SELECT key, value FROM app_settings WHERE key = ANY($1::text[])`,
+      [PUBLIC_SETTING_KEYS]
+    );
+    const out = {};
+    for (const row of r.rows) out[row.key] = row.value;
+    return res.json({
+      ok: true,
+      feedbackUrl: out.feedback_url || "",
+      feedbackEnabled: String(out.feedback_enabled) === "true" && !!(out.feedback_url || "").trim(),
+    });
+  } catch (err) {
+    console.error("Update app settings error:", err);
+    return res.status(500).json({ error: "Could not save settings" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ACCOUNT — changing your own email address and password.
+//
+// Email is the login identifier, so changing it is a security operation, not a
+// profile edit. Three things guard it:
+//   • the current password must be given, so a borrowed session isn't enough
+//   • a code goes to the NEW address and must come back, proving it's real
+//   • the OLD address is told a change was requested, so a hijack is visible
+// The code is stored hashed with an attempt limit and expiry, same as the
+// password reset flow.
+// ─────────────────────────────────────────────────────────────────────────────
+let emailChangesReady = false;
+async function ensureEmailChanges() {
+  if (emailChangesReady) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS email_changes (
+      id BIGSERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      new_email TEXT NOT NULL,
+      code_hash TEXT NOT NULL,
+      attempts INTEGER DEFAULT 0,
+      used BOOLEAN DEFAULT FALSE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_email_changes_user ON email_changes (user_id, created_at DESC)`); } catch {}
+  emailChangesReady = true;
+}
+
+app.post("/me/email/request", requireAuth, async (req, res) => {
+  try {
+    await ensureEmailChanges();
+    const newEmail = String(req.body?.newEmail || "").toLowerCase().trim();
+    const currentPassword = String(req.body?.currentPassword || "");
+
+    if (!/^\S+@\S+\.\S+$/.test(newEmail)) {
+      return res.status(400).json({ error: "Enter a valid email address." });
+    }
+    if (!currentPassword) {
+      return res.status(400).json({ error: "Enter your current password." });
+    }
+
+    const me = await pool.query(`SELECT id, email, name, password_hash FROM users WHERE id = $1`, [req.user.id]);
+    const user = me.rows[0];
+    if (!user) return res.status(404).json({ error: "Account not found" });
+
+    const ok = await bcrypt.compare(currentPassword, user.password_hash);
+    if (!ok) return res.status(403).json({ error: "That password isn't right." });
+
+    if (newEmail === String(user.email).toLowerCase()) {
+      return res.status(400).json({ error: "That's already your email address." });
+    }
+    const taken = await pool.query(`SELECT id FROM users WHERE LOWER(email) = $1`, [newEmail]);
+    if (taken.rows.length) {
+      return res.status(409).json({ error: "Another account already uses that address." });
+    }
+    if (!mailer) {
+      return res.status(503).json({ error: "Email isn't configured on the server, so the address can't be verified yet." });
+    }
+
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const codeHash = await bcrypt.hash(code, 10);
+    // Any earlier pending request is retired, so only the newest code works.
+    await pool.query(`UPDATE email_changes SET used = TRUE WHERE user_id = $1 AND used = FALSE`, [user.id]);
+    await pool.query(
+      `INSERT INTO email_changes (user_id, new_email, code_hash, expires_at)
+       VALUES ($1, $2, $3, NOW() + INTERVAL '30 minutes')`,
+      [user.id, newEmail, codeHash]
+    );
+
+    const safeName = String(user.name || "there").replace(/[<>]/g, "");
+    await sendEmail(
+      newEmail,
+      "Confirm your new email address",
+      `<div style="font-family:Arial,Helvetica,sans-serif;max-width:560px">
+         <h2 style="margin:0 0 12px">Confirm your email address</h2>
+         <p style="margin:0 0 12px;line-height:1.6">Hi ${safeName}, enter this code in the app to switch your No Rule Nutrition account to this address:</p>
+         <p style="font-size:30px;letter-spacing:7px;font-weight:bold;margin:0 0 12px">${code}</p>
+         <p style="margin:0;color:#888;font-size:12px">The code expires in 30 minutes. If you didn't ask for this, you can ignore it.</p>
+       </div>`
+    );
+    // The old address is told, so a change made by someone else is noticed.
+    sendEmail(
+      user.email,
+      "A change of email address was requested",
+      `<div style="font-family:Arial,Helvetica,sans-serif;max-width:560px">
+         <p style="margin:0 0 12px;line-height:1.6">Someone asked to move your No Rule Nutrition account to <b>${newEmail.replace(/[<>]/g, "")}</b>. It won't move until the code sent to that address is entered.</p>
+         <p style="margin:0;color:#888;font-size:12px">If that wasn't you, change your password now — whoever asked had your current one.</p>
+       </div>`
+    ).catch(() => {});
+
+    return res.json({ ok: true, sentTo: newEmail });
+  } catch (err) {
+    console.error("Email change request error:", err);
+    return res.status(500).json({ error: "Could not start the email change" });
+  }
+});
+
+app.post("/me/email/confirm", requireAuth, async (req, res) => {
+  try {
+    await ensureEmailChanges();
+    const code = String(req.body?.code || "").replace(/\D/g, "");
+    if (code.length !== 6) return res.status(400).json({ error: "Enter the 6-digit code." });
+
+    const pending = await pool.query(
+      `SELECT id, new_email, code_hash, attempts FROM email_changes
+        WHERE user_id = $1 AND used = FALSE AND expires_at > NOW()
+        ORDER BY created_at DESC LIMIT 1`,
+      [req.user.id]
+    );
+    const row = pending.rows[0];
+    if (!row) return res.status(400).json({ error: "That code has expired — start again." });
+    if (row.attempts >= 5) return res.status(429).json({ error: "Too many attempts — start again." });
+
+    const match = await bcrypt.compare(code, row.code_hash);
+    if (!match) {
+      await pool.query(`UPDATE email_changes SET attempts = attempts + 1 WHERE id = $1`, [row.id]);
+      return res.status(400).json({ error: "That code isn't right." });
+    }
+
+    // Re-check availability: someone else may have taken it in the meantime.
+    const taken = await pool.query(
+      `SELECT id FROM users WHERE LOWER(email) = $1 AND id <> $2`,
+      [String(row.new_email).toLowerCase(), req.user.id]
+    );
+    if (taken.rows.length) {
+      await pool.query(`UPDATE email_changes SET used = TRUE WHERE id = $1`, [row.id]);
+      return res.status(409).json({ error: "Another account took that address while you were confirming." });
+    }
+
+    await pool.query(`UPDATE users SET email = $1 WHERE id = $2`, [row.new_email, req.user.id]);
+    await pool.query(`UPDATE email_changes SET used = TRUE WHERE id = $1`, [row.id]);
+
+    // The old token carries the old email in its payload. Auth keys off the id
+    // so it still works, but hand back a fresh one to keep them consistent.
+    const updated = await pool.query(
+      `SELECT id, email, name, role FROM users WHERE id = $1`, [req.user.id]
+    );
+    const u = updated.rows[0];
+    const token = issueToken(u);
+    return res.json({ ok: true, email: u.email, token });
+  } catch (err) {
+    console.error("Email change confirm error:", err);
+    return res.status(500).json({ error: "Could not change the email address" });
+  }
+});
+
+// Change your own password. The Change Password control in the app used to do
+// nothing at all; this is what it calls now.
+app.post("/me/password", requireAuth, async (req, res) => {
+  try {
+    const currentPassword = String(req.body?.currentPassword || "");
+    const newPassword = String(req.body?.newPassword || "");
+    if (!currentPassword) return res.status(400).json({ error: "Enter your current password." });
+    if (newPassword.length < 8) return res.status(400).json({ error: "New password must be at least 8 characters." });
+    if (newPassword === currentPassword) return res.status(400).json({ error: "That's the same as your current password." });
+
+    const me = await pool.query(`SELECT id, email, password_hash FROM users WHERE id = $1`, [req.user.id]);
+    const user = me.rows[0];
+    if (!user) return res.status(404).json({ error: "Account not found" });
+
+    const ok = await bcrypt.compare(currentPassword, user.password_hash);
+    if (!ok) return res.status(403).json({ error: "That password isn't right." });
+
+    await pool.query(`UPDATE users SET password_hash = $1 WHERE id = $2`, [await bcrypt.hash(newPassword, 12), user.id]);
+
+    // Tell them it changed, so a password taken by someone else is visible.
+    sendEmail(
+      user.email,
+      "Your password was changed",
+      `<div style="font-family:Arial,Helvetica,sans-serif;max-width:560px">
+         <p style="margin:0 0 12px;line-height:1.6">Your No Rule Nutrition password was just changed.</p>
+         <p style="margin:0;color:#888;font-size:12px">If that wasn't you, use "Forgot password?" on the sign-in screen to take the account back.</p>
+       </div>`
+    ).catch(() => {});
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Change password error:", err);
+    return res.status(500).json({ error: "Could not change the password" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // RESTAURANTS & MENUS — eating-out data this platform holds itself.
 //
 // Open Food Facts is organised around barcodes, so it covers packaged retail
@@ -5638,6 +5915,10 @@ app.listen(PORT, async () => {
 
     // Restaurants & menus — eating-out data held here rather than in OFF.
     try { await ensureRestaurantTables(); } catch (e) { console.warn("restaurant tables:", e.message); }
+
+    // Settings and account-change tables.
+    try { await ensureAppSettings(); } catch (e) { console.warn("app settings:", e.message); }
+    try { await ensureEmailChanges(); } catch (e) { console.warn("email changes:", e.message); }
 
 console.log("✅ DB ready");
 
