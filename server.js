@@ -4571,9 +4571,19 @@ app.get("/off/search", requireAuth, async (req, res) => {
 // The beta bug & suggestion form. Set here so a fresh deploy has it without
 // anyone calling the settings endpoint; FEEDBACK_URL overrides it, and an
 // admin can change it at runtime through PATCH /app-settings.
+// Prefilled so a tester doesn't retype what the app already knows. The
+// entry IDs come from the form's own "Get pre-filled link":
+//   1344310203  Your name
+//   1290760173  Which part of No Rules is this about?   (must match an option)
+//   1726247094  Bugs only: what were you doing (device, app version)
+// The app substitutes {name}, {platformLabel} and {device} per tester.
 const DEFAULT_FEEDBACK_URL =
   process.env.FEEDBACK_URL ||
-  "https://docs.google.com/forms/d/e/1FAIpQLSdFlL4e7Y8394X0LCF75htGXneovGqPNpgqkM0rsos1npcaZA/viewform";
+  "https://docs.google.com/forms/d/e/1FAIpQLSdFlL4e7Y8394X0LCF75htGXneovGqPNpgqkM0rsos1npcaZA/viewform" +
+    "?usp=pp_url" +
+    "&entry.1344310203={name}" +
+    "&entry.1290760173={platformLabel}" +
+    "&entry.1726247094={device}";
 
 let appSettingsReady = false;
 async function ensureAppSettings() {
