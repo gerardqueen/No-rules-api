@@ -4764,14 +4764,14 @@ app.post("/me/email/request", requireAuth, async (req, res) => {
     const codeHash = await bcrypt.hash(code, 10);
     // Any earlier pending request is retired, so only the newest code works.
     await pool.query(`UPDATE email_changes SET used = TRUE WHERE user_id = $1 AND used = FALSE`, [user.id]);
-    await pool.query(
+    const pending = await pool.query(
       `INSERT INTO email_changes (user_id, new_email, code_hash, expires_at)
-       VALUES ($1, $2, $3, NOW() + INTERVAL '30 minutes')`,
+       VALUES ($1, $2, $3, NOW() + INTERVAL '30 minutes') RETURNING id`,
       [user.id, newEmail, codeHash]
     );
 
     const safeName = String(user.name || "there").replace(/[<>]/g, "");
-    await sendEmail(
+    const sent = await sendEmail(
       newEmail,
       "Confirm your new email address",
       `<div style="font-family:Arial,Helvetica,sans-serif;max-width:560px">
@@ -4781,6 +4781,23 @@ app.post("/me/email/request", requireAuth, async (req, res) => {
          <p style="margin:0;color:#888;font-size:12px">The code expires in 30 minutes. If you didn't ask for this, you can ignore it.</p>
        </div>`
     );
+
+    // A send can fail even with the mailer configured: a revoked app password,
+    // Google blocking the login, a bad address. sendEmail catches that and
+    // returns { ok:false } rather than throwing, so without this check the
+    // route answered 200 and the app told the user "we've sent you a code"
+    // when nothing had been sent. The pending row is retired as well — a code
+    // nobody can read should not sit there waiting to be guessed.
+    if (!sent.ok) {
+      try {
+        await pool.query(`UPDATE email_changes SET used = TRUE WHERE id = $1`, [pending.rows[0].id]);
+      } catch {}
+      console.error(`Email change: code to ${newEmail} failed for user ${user.id} —`, sent.reason);
+      return res.status(502).json({
+        error: "We couldn't send the code to that address. Nothing on your account has changed — check the address and try again.",
+      });
+    }
+
     // The old address is told, so a change made by someone else is noticed.
     sendEmail(
       user.email,
@@ -5485,7 +5502,15 @@ app.delete("/coach-videos/:athleteId/:id", requireAuth, requireCoach, async (req
 app.post("/auth/logout", requireAuth, async (req, res) => res.json({ ok: true }));
 
 app.get("/health", (req, res) => {
-  return res.json({ status: "ok", timestamp: new Date().toISOString() });
+  // emailEnabled says whether GMAIL_USER + GMAIL_APP_PASSWORD were both present
+  // at boot. It separates "the server was never given mail credentials" from
+  // "Gmail rejected the send" in one request, without digging through deploy
+  // logs. It is a boolean about configuration — no address, no credential.
+  return res.json({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    emailEnabled: !!mailer,
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
