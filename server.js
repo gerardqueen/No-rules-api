@@ -535,6 +535,9 @@ app.get("/auth/me", requireAuth, async (req, res) => {
       nutritionEnabled: user.nutrition_enabled !== false,
       marketingOptIn: user.marketing_opt_in === true,
       signupSource: user.signup_source || "coach",
+      // Carried on the profile so the hub can hide sections on first paint
+      // instead of rendering them and snatching them away a moment later.
+      features: await featuresForAthlete(user.id),
     });
   } catch (err) {
     console.error("Auth/me error:", err);
@@ -4729,6 +4732,117 @@ async function ensureEmailChanges() {
   emailChangesReady = true;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// HUB FEATURES — which trackers a client actually sees
+// A client who doesn't measure their waist shouldn't scroll past a
+// measurements card forever. Coaches switch these per client; a self sign-up
+// with no coach manages their own.
+//
+// Only EXPLICIT choices are stored. A missing row means on, which has two
+// consequences worth keeping in mind:
+//   • a feature added later turns up for everyone without a backfill
+//   • switching something back on deletes nothing — it just writes TRUE
+// The catalog lives here so the CMS and the app can't drift apart on the
+// key names; both read it from the API rather than hardcoding a list.
+// ─────────────────────────────────────────────────────────────────────────────
+const HUB_FEATURES = [
+  { key: "habits", label: "Habits", blurb: "Daily habit list with RAG ratings" },
+  { key: "weight", label: "Weight", blurb: "Weight log and trend chart" },
+  { key: "mood", label: "Mood", blurb: "Daily mood check" },
+  { key: "measurements", label: "Measurements", blurb: "Body measurements and history" },
+  { key: "health", label: "Apple Health", blurb: "Steps, sleep and activity" },
+  { key: "benchmarks", label: "Benchmarks", blurb: "1RMs, row and run times" },
+];
+const HUB_FEATURE_KEYS = HUB_FEATURES.map((f) => f.key);
+
+let athleteFeaturesReady = false;
+async function ensureAthleteFeatures() {
+  if (athleteFeaturesReady) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS athlete_features (
+      athlete_id INTEGER NOT NULL,
+      feature_key TEXT NOT NULL,
+      enabled BOOLEAN NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (athlete_id, feature_key)
+    );
+  `);
+  athleteFeaturesReady = true;
+}
+
+// Always returns every key. A read failure means everything on rather than a
+// broken hub — the same rule /app-settings follows.
+async function featuresForAthlete(athleteId) {
+  const out = {};
+  for (const k of HUB_FEATURE_KEYS) out[k] = true;
+  try {
+    const r = await pool.query(
+      `SELECT feature_key, enabled FROM athlete_features WHERE athlete_id = $1`,
+      [athleteId]
+    );
+    for (const row of r.rows) {
+      if (Object.prototype.hasOwnProperty.call(out, row.feature_key)) {
+        out[row.feature_key] = row.enabled === true;
+      }
+    }
+  } catch {}
+  return out;
+}
+
+app.get("/athletes/:athleteId/features", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    await ensureAthleteFeatures();
+    const athleteId = Number(req.params.athleteId);
+    return res.json({ features: await featuresForAthlete(athleteId), catalog: HUB_FEATURES });
+  } catch (err) {
+    console.error("Get features error:", err);
+    return res.status(500).json({ error: "Could not load features" });
+  }
+});
+
+app.patch("/athletes/:athleteId/features", requireAuth, requireSelfOrCoachOfAthlete, async (req, res) => {
+  try {
+    await ensureAthleteFeatures();
+    const athleteId = Number(req.params.athleteId);
+    const isStaff = req.user.role === "coach" || req.user.role === "admin";
+
+    // Same ownership rule as /services: once a client is claimed, the coach
+    // decides. A self sign-up with no coach manages their own hub.
+    if (!isStaff) {
+      const who = await pool.query(`SELECT coach_id FROM users WHERE id = $1`, [athleteId]);
+      if (!who.rows.length) return res.status(404).json({ error: "Account not found" });
+      if (who.rows[0].coach_id) {
+        return res.status(403).json({
+          error: "Your coach sets which trackers you see — message them to change it.",
+        });
+      }
+    }
+
+    const body = (req.body && typeof req.body.features === "object" && req.body.features) || req.body || {};
+    const updates = HUB_FEATURE_KEYS
+      .filter((k) => typeof body[k] === "boolean")
+      .map((k) => [k, body[k]]);
+    if (!updates.length) return res.status(400).json({ error: "Nothing to change." });
+
+    for (const [key, enabled] of updates) {
+      // DO UPDATE, not DO NOTHING: a client already holding a row for this key
+      // is the normal case, and DO NOTHING would silently keep the old value.
+      await pool.query(
+        `INSERT INTO athlete_features (athlete_id, feature_key, enabled)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (athlete_id, feature_key)
+         DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = NOW()`,
+        [athleteId, key, enabled]
+      );
+    }
+
+    return res.json({ ok: true, features: await featuresForAthlete(athleteId) });
+  } catch (err) {
+    console.error("Patch features error:", err);
+    return res.status(500).json({ error: "Could not save features" });
+  }
+});
+
 app.post("/me/email/request", requireAuth, async (req, res) => {
   try {
     await ensureEmailChanges();
@@ -5988,6 +6102,7 @@ app.listen(PORT, async () => {
     // Settings and account-change tables.
     try { await ensureAppSettings(); } catch (e) { console.warn("app settings:", e.message); }
     try { await ensureEmailChanges(); } catch (e) { console.warn("email changes:", e.message); }
+    try { await ensureAthleteFeatures(); } catch (e) { console.warn("athlete features:", e.message); }
 
 console.log("✅ DB ready");
 
